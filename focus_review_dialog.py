@@ -93,7 +93,7 @@ class FocusReviewDialog(QDialog):
 
         self.figure.clear()
         ax = self.figure.add_subplot(111)
-        ax.plot(fit.z, fit.f, "o", label="measured")
+        ax.plot(fit.z, fit.normalized_f(), "o", label="measured (normalized)")
         if fit.params is not None:
             z_vals, curve_vals = fit.curve_preview()
             ax.plot(z_vals, curve_vals, "-", label="fit")
@@ -101,7 +101,7 @@ class FocusReviewDialog(QDialog):
         if z_opt is not None:
             ax.axvline(z_opt, color="red", linestyle="--", label="chosen Z")
         ax.set_xlabel("Z (mm)")
-        ax.set_ylabel("focus metric")
+        ax.set_ylabel("normalized focus metric")
         ax.legend()
         self.canvas.draw_idle()
 

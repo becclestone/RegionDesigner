@@ -219,6 +219,14 @@ class ControllerBridge(QObject):
                 ic.cSECTION_COL: 0,
                 ic.cPATH: path_json,
                 ic.cIS_LUCAS_PATH: True,
+                # dover_ctl2/src/MsgHandler.cpp:932-933 (handle_path) reads these two
+                # unconditionally for every cPATH_MSG, regardless of scan_type - a
+                # missing field auto-vivifies as JSON null on the controller side,
+                # which throws "type must be boolean, but is null" there. This is
+                # never actually a resumed scan here, so False/"" (DOVER_UI's own
+                # defaults - see Utilities/path_utilites.py's send_execute_path_msg).
+                ic.cIS_RESUMED_SCAN_PATH: False,
+                ic.cIS_RESUME_DIRECTORY_NAME: "",
             }
             msg = TIsMsg.create_cmd_msg(ic.cPATH_MSG, ic.CTL_TARGET)
             msg.add_msg_payload(payload)

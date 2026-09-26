@@ -37,8 +37,13 @@ class FocusFit:
         self.peak_offset = None
         self.z_opt = None
 
+    def normalized_f(self):
+        """f rescaled into the same [0.3, 1.3]-ish range the fit is performed in,
+        so measured points and the fitted curve can be plotted on one axis."""
+        return (self.f - self.f.min()) / (self.f.max() - self.f.min()) + 0.3
+
     def fit(self):
-        temp_f = (self.f - self.f.min()) / (self.f.max() - self.f.min()) + 0.3
+        temp_f = self.normalized_f()
         init_params = [0.9, self.z[int(len(self.z) * 0.6)], 1e5,
                         0.9, self.z[int(len(self.z) * 0.4)], 1e5]
         try:
