@@ -28,9 +28,21 @@ from Utilities.controller_commands import move_to_snap_position
 # COMM messages, not TBR-routed replies (confirmed by reading MsgHandler.cpp). So
 # only one such hardware-affecting request may be in flight at a time; _busy below
 # enforces that. A request that times out can leave one stale reply behind in the
-# corresponding queue for the next call to (harmlessly) drain first.
+# corresponding queue - _drain() below clears it immediately before the next send,
+# so that call's own .get() can't mistake the stale reply for its own.
 _DEFAULT_AUTOFOCUS_TIMEOUT_S = 60.0
 _DEFAULT_SCAN_TIMEOUT_S = 120.0
+
+
+def _drain(q: Queue) -> None:
+    """Discards any stale reply left behind by a previous timed-out call, so the
+    .get() that follows is guaranteed to consume the reply to *this* request
+    rather than a leftover one (see the _busy docstring note above)."""
+    while True:
+        try:
+            q.get_nowait()
+        except Empty:
+            return
 
 
 class ControllerBridge(QObject):
@@ -130,6 +142,7 @@ class ControllerBridge(QObject):
             }
             msg = TIsMsg.create_cmd_msg(ic.cCALCULATE_AUTOFOCUS_MSG, ic.CTL_TARGET)
             msg.add_msg_payload(payload)
+            _drain(self._autofocus_reply_queue)
             msg.send_q_destroy()
 
             reply_payload = self._autofocus_reply_queue.get(timeout=timeout)
@@ -161,6 +174,7 @@ class ControllerBridge(QObject):
             }
             msg = TIsMsg.create_cmd_msg(ic.cSET_ANCHOR_POINT_MSG, ic.CTL_TARGET)
             msg.add_msg_payload(payload)
+            _drain(self._anchor_reply_queue)
             msg.send_q_destroy()
 
             reply_payload = self._anchor_reply_queue.get(timeout=timeout)
@@ -208,6 +222,7 @@ class ControllerBridge(QObject):
             }
             msg = TIsMsg.create_cmd_msg(ic.cPATH_MSG, ic.CTL_TARGET)
             msg.add_msg_payload(payload)
+            _drain(self._path_reply_queue)
             msg.send_q_destroy()
 
             kind, reply_payload = self._path_reply_queue.get(timeout=timeout)
