@@ -83,6 +83,13 @@ class RegionDesignerWindow(QMainWindow):
 
         toolbar.addSeparator()
 
+        self.show_grid_btn = QPushButton("Show Grid")
+        self.show_grid_btn.setCheckable(True)
+        self.show_grid_btn.toggled.connect(self.canvas.set_show_grid)
+        toolbar.addWidget(self.show_grid_btn)
+
+        toolbar.addSeparator()
+
         snap_btn = QPushButton("Snap Image")
         snap_btn.clicked.connect(self._on_snap_clicked)
         toolbar.addWidget(snap_btn)

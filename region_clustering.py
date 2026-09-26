@@ -27,7 +27,7 @@ COL_STEP_MM = pc.cSECTION_WIDTH_TO_OVERLAP_MM
 
 # Operators typically overselect the tissue when painting, so the painted boundary
 # runs a bit past the true sample edge - keep focus points off this outer rim.
-EDGE_EXCLUSION_MM = 1.0
+EDGE_EXCLUSION_MM = 0.75
 
 
 def _scale(sections: np.ndarray) -> np.ndarray:

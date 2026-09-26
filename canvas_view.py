@@ -8,6 +8,8 @@ The brush itself paints a free-form circular stroke in continuous scene (image)
 space while the mouse is down - the stroke is only converted into the discrete
 painted-section set once the mouse button is released.
 """
+import math
+
 from PIL import Image as PILImage
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal
 from PySide6.QtGui import (
@@ -60,6 +62,8 @@ _BRUSH_CURSOR_COLOR = QColor(255, 255, 255, 220)
 _LABEL_TEXT_COLOR = QColor(255, 255, 255)
 _LABEL_BG_COLOR = QColor(0, 0, 0, 170)
 
+_GRID_LINE_COLOR = QColor(255, 255, 0, 70)
+
 
 class SectionCanvas(QGraphicsView):
     sectionsChanged = Signal()
@@ -91,8 +95,9 @@ class SectionCanvas(QGraphicsView):
         self.region_of: dict[Section, int] = {}
         self.draw_mode = True  # False once regions are compiled - brush is inactive until cleared
         self.active_region_id: int | None = None  # region currently being scanned - drawn highlighted
+        self.show_grid = False  # overlay of section-grid lines, toggled from the toolbar
 
-        self.brush_radius = 6  # radius in section-width units (true circular radius in scene pixels)
+        self.brush_radius = 4  # radius in section-width units (true circular radius in scene pixels)
         self._painting = False
         self._erase_mode = False
         self._stroke_path: QPainterPath | None = None
@@ -111,6 +116,7 @@ class SectionCanvas(QGraphicsView):
         self._scene.addItem(self.background_item)
         self._scene.setSceneRect(QRectF(self.background_item.boundingRect()))
         self._reset_mask(pixmap.width(), pixmap.height())
+        self._redraw_mask()
 
     def _reset_mask(self, width: int, height: int):
         self.mask_image = QImage(max(width, 1), max(height, 1), QImage.Format.Format_ARGB32_Premultiplied)
@@ -309,6 +315,8 @@ class SectionCanvas(QGraphicsView):
     def _redraw_mask(self):
         self.mask_image.fill(Qt.GlobalColor.transparent)
         painter = QPainter(self.mask_image)
+        if self.show_grid:
+            self._draw_grid(painter)
         region_centroid_sum: dict[int, list[float]] = {}  # region_id -> [sum_x, sum_y, count]
         for (row, col) in self.painted:
             region_id = self.region_of.get((row, col))
@@ -349,6 +357,40 @@ class SectionCanvas(QGraphicsView):
 
         painter.end()
         self.mask_item.setPixmap(QPixmap.fromImage(self.mask_image))
+
+    def _draw_grid(self, painter: QPainter):
+        """Draws section-grid lines across the whole image, so the operator can see
+        how sections line up before/while painting - independent of self.painted."""
+        width = self.mask_image.width()
+        height = self.mask_image.height()
+        w_step = geom.WIDTH_STEP * self.zoom
+        h_step = geom.HEIGHT_STEP * self.zoom
+        if w_step <= 0 or h_step <= 0:
+            return
+        anchor_x, anchor_y = self.anchor
+
+        pen = QPen(_GRID_LINE_COLOR, 1)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+
+        min_col = math.floor((0 - anchor_x) / w_step) - 1
+        max_col = math.ceil((width - anchor_x) / w_step) + 1
+        for col in range(min_col, max_col + 1):
+            x = anchor_x + col * w_step
+            painter.drawLine(QPointF(x, 0), QPointF(x, height))
+
+        min_row = math.floor((0 - anchor_y) / h_step) - 1
+        max_row = math.ceil((height - anchor_y) / h_step) + 1
+        for row in range(min_row, max_row + 1):
+            y = anchor_y + row * h_step
+            painter.drawLine(QPointF(0, y), QPointF(width, y))
+
+    def set_show_grid(self, show: bool):
+        if show == self.show_grid:
+            return
+        self.show_grid = show
+        if self.mask_image is not None:
+            self._redraw_mask()
 
     def _draw_region_label(self, painter: QPainter, region_id: int, cx: float, cy: float):
         """Draws the region's scan-order number (its region_id, which clustering
