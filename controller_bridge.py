@@ -42,6 +42,7 @@ class ControllerBridge(QObject):
         self._rmq_queue: Queue = Queue(maxsize=100)
         self._autofocus_reply_queue: Queue = Queue()
         self._path_reply_queue: Queue = Queue()
+        self._anchor_reply_queue: Queue = Queue()
         self._running = False
         self._busy = False
         self._listener_thread: Thread | None = None
@@ -87,6 +88,8 @@ class ControllerBridge(QObject):
             self._path_reply_queue.put(("update", msg.get_msg_payload()))
         elif msg_type == src.cREPLY_MSG and msg.get_msg_reply_type() == ic.cPATH_MSG:
             self._path_reply_queue.put(("ack", msg.get_msg_payload()))
+        elif msg_type == src.cREPLY_MSG and msg.get_msg_reply_type() == ic.cSET_ANCHOR_POINT_MSG:
+            self._anchor_reply_queue.put(msg.get_msg_payload())
 
     def request_snap(self):
         """Mirrors DOVER_UI/Windows/demo_control_a.py's Snap button sequence exactly."""
@@ -97,21 +100,30 @@ class ControllerBridge(QObject):
     def is_busy(self) -> bool:
         return self._busy
 
-    def run_autofocus(self, x: float, y: float, z_start: float, z_step: float, num_layers: int,
+    def run_autofocus(self, row: int, col: int, z_start: float, z_step: float, num_layers: int,
                        timeout: float = _DEFAULT_AUTOFOCUS_TIMEOUT_S) -> list:
         """Blocking - call from a worker thread, never the GUI thread. Returns the
         raw focus-metric curve (cPLOT_FOCUS_VALUES_PARAM); z per index is
         z_start + i*z_step (not echoed back by the controller, so we reconstruct it).
-        Uses absolute X/Y (dover_ctl2 MsgHandler.cpp:1803-1808 supports this server-side
-        even though DOVER_UI's own Python client never actually sends this branch)."""
+
+        row/col must already be final master-grid values (same convention as
+        run_single_section_scan below). Uses the row/col branch, not absolute X/Y:
+        reading dover_ctl2 MsgHandler.cpp:1803-1820 this session found that the
+        absolute-XY branch passes its X straight through as the sweep's start
+        position, skipping the FocusXPositionStart offset the row/col branch
+        applies - a real alignment bug, and consistent with it never having been
+        exercised by any client (DOVER_UI's own Python client only ever sends
+        row/col). For sub-cell precision despite only-whole-row/col addressing,
+        autofocus_client.py temporarily shifts the controller's anchor via
+        set_anchor() below before calling this."""
         if self._busy:
             raise RuntimeError("Another hardware operation is already in progress.")
         self._busy = True
         try:
             payload = {
-                ic.cCALCULATION_POSITION_TYPE_PARAM: True,
-                ic.cABSOLUTE_X_PARAM: x,
-                ic.cABSOLUTE_Y_PARAM: y,
+                ic.cCALCULATION_POSITION_TYPE_PARAM: False,
+                ic.cMASTER_SECTION_ROW_PARAM: row,
+                ic.cMASTER_SECTION_COL_PARAM: col,
                 ic.cNUMBER_OF_FOCUS_LAYERS_PARAM: num_layers,
                 ic.cSTARTING_Z_FOCUS_CALCULATION_PARAM: z_start,
                 ic.cFOCUS_CALCULATION_STEP_PARAM: z_step,
@@ -122,6 +134,38 @@ class ControllerBridge(QObject):
 
             reply_payload = self._autofocus_reply_queue.get(timeout=timeout)
             return reply_payload[ic.cPLOT_FOCUS_VALUES_PARAM]
+        finally:
+            self._busy = False
+
+    def set_anchor(self, x: float, y: float, z: float, z_offset: float,
+                    timeout: float = _DEFAULT_AUTOFOCUS_TIMEOUT_S) -> None:
+        """Blocking - sets the controller's master-grid anchor (g_anchor_master_grid_X/Y,
+        g_scan_position_z, g_focus_offset_correction) via cSET_ANCHOR_POINT_MSG, the
+        same message DOVER_UI's Stage Calibration tab sends. There's no query message
+        for this state (see stage_calibration.py's module docstring), so every call
+        here must pass all four values - a partial update isn't possible without
+        risking clobbering Z/Z-offset with a stale value. Used by autofocus_client.py
+        to temporarily shift X/Y for one focus point's autofocus call, then restore
+        the real calibration immediately after; also used as a safety net to
+        (re)assert the real calibration right before a scan."""
+        if self._busy:
+            raise RuntimeError("Another hardware operation is already in progress.")
+        self._busy = True
+        try:
+            payload = {
+                ic.cTAB_SENDER: "region_designer",
+                ic.cX_POS_PM: x,
+                ic.cY_POS_PM: y,
+                ic.cZ_POS_PM: z,
+                ic.cZO_POS: z_offset,
+            }
+            msg = TIsMsg.create_cmd_msg(ic.cSET_ANCHOR_POINT_MSG, ic.CTL_TARGET)
+            msg.add_msg_payload(payload)
+            msg.send_q_destroy()
+
+            reply_payload = self._anchor_reply_queue.get(timeout=timeout)
+            if reply_payload.get(src.cERROR) != src.cSUCCESS:
+                raise RuntimeError(reply_payload.get(src.cERROR_STR, "Anchor point rejected by controller."))
         finally:
             self._busy = False
 

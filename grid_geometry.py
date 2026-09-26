@@ -29,9 +29,9 @@ def section_center(row: int, col: int, anchor: tuple[float, float], zoom: float)
 
 def point_to_section_f(x: float, y: float, anchor: tuple[float, float], zoom: float) -> tuple[float, float]:
     """Continuous (non-truncated) row/col - used for focus points, which the user
-    wants free to sit anywhere rather than snapped to a grid cell (the physical
-    XY formula in stage_calibration.py is linear, so a fractional row/col is just
-    as valid a position as an integer one)."""
+    wants free to sit anywhere rather than snapped to a grid cell (stage_calibration
+    accepts a fractional row/col directly, by temporarily shifting the controller's
+    anchor - see autofocus_client.py)."""
     col = (x - anchor[0]) / (WIDTH_STEP * zoom)
     row = (y - anchor[1]) / (HEIGHT_STEP * zoom)
     return row, col

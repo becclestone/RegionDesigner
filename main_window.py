@@ -13,7 +13,7 @@ from autofocus_client import AutofocusSequenceWorker
 from focus_review_dialog import FocusReviewDialog
 from region_plane_fit import RegionPlaneFit
 
-_DEFAULT_TARGET_REGION_SIZE = 75
+_DEFAULT_TARGET_REGION_SIZE = 100
 _DEFAULT_FOCUS_POINTS_PER_REGION = 4
 _DEFAULT_AF_Z_START = -0.010
 
@@ -250,7 +250,7 @@ class RegionDesignerWindow(QMainWindow):
         if not worker.fits:
             return
 
-        dialog = FocusReviewDialog(self.bridge, region_id, worker.fits, parent=self)
+        dialog = FocusReviewDialog(self.bridge, self.calibration, region_id, worker.fits, parent=self)
         if dialog.exec() == FocusReviewDialog.DialogCode.Accepted:
             self.region_focus_points[region_id] = dialog.result_focus_points()
             self.status_label.setText(

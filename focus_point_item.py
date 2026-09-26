@@ -33,8 +33,10 @@ class FocusPointItem(QGraphicsEllipseItem):
 
     def section(self) -> tuple[float, float]:
         """Continuous (row, col) - not snapped to a grid cell. Use this for
-        autofocus/physical positioning (stage_calibration.section_to_absolute_xy
-        accepts fractional row/col directly)."""
+        autofocus/physical positioning: stage_calibration.StageCalibration accepts
+        fractional row/col directly, temporarily shifting the controller's anchor
+        to hit the exact fractional location despite the controller only actually
+        addressing whole master-grid rows/columns (see autofocus_client.py)."""
         return self._row, self._col
 
     def grid_cell(self) -> tuple[int, int]:

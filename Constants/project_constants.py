@@ -561,6 +561,7 @@ cDETECTION_ON_STATUS_NOTIFICATION = '=gOnSN'
 cX = 'X'
 cY = 'Y'
 cZ = 'Z'
+cZO = 'ZOffset'
 cROW = 'Row'
 cCOL = 'Col'
 #

@@ -1,8 +1,16 @@
 """Runs the live per-point autofocus sequence for a region: for each focus point,
-a hierarchical coarse -> medium -> fine sweep of absolute-XY cCALCULATE_AUTOFOCUS_MSG
-calls, strictly one at a time (see controller_bridge.run_autofocus's docstring for
-why). Runs on a background thread so the Qt event loop never blocks on the
-(synchronous, hardware-bound) ControllerBridge calls.
+a hierarchical coarse -> medium -> fine sweep of row/col-addressed
+cCALCULATE_AUTOFOCUS_MSG calls, strictly one at a time (see
+controller_bridge.run_autofocus's docstring for why). Runs on a background thread
+so the Qt event loop never blocks on the (synchronous, hardware-bound)
+ControllerBridge calls.
+
+Since the controller's autofocus command only actually positions correctly on a
+whole master-grid row/column (see run_autofocus's docstring), each focus point's
+possibly-fractional row/col is handled by temporarily shifting the controller's
+anchor (StageCalibration.shifted_anchor_for_focus) so that its *rounded*
+row/col lands exactly on the point's true location, running that point's full
+coarse/medium/fine sweep, then restoring the real calibration before moving on.
 
 Stage roles:
 - coarse: one wide, coarse-step sweep on the region's first point only, to locate
@@ -83,40 +91,49 @@ class AutofocusSequenceWorker(QObject):
         for index, (row, col) in enumerate(self.points):
             self.pointStarted.emit(index, total)
             try:
-                x, y = self.calibration.section_to_absolute_xy(row, col)
+                anchor, master_row, master_col = self.calibration.shifted_anchor_for_focus(row, col)
+                self.bridge.set_anchor(**anchor)
+                try:
+                    if index == 0:
+                        z_center = self._run_sweep(master_row, master_col, z_center, self.stage_config["coarse"])
 
-                if index == 0:
-                    z_center = self._run_sweep(x, y, z_center, self.stage_config["coarse"])
+                    z_center = self._run_sweep(master_row, master_col, z_center, self.stage_config["medium"])
+                    fit = self._run_fine(master_row, master_col, row, col, z_center)
+                    z_center = fit.z_opt if fit.z_opt is not None else fit.max_loc
 
-                z_center = self._run_sweep(x, y, z_center, self.stage_config["medium"])
-                fit = self._run_fine(x, y, row, col, z_center)
-                z_center = fit.z_opt if fit.z_opt is not None else fit.max_loc
-
-                self.fits.append(fit)
-                self.pointFitted.emit(index, fit)
+                    self.fits.append(fit)
+                    self.pointFitted.emit(index, fit)
+                finally:
+                    # Always restore the real calibration, even if this point's
+                    # sweeps failed partway through - a shifted anchor must never
+                    # be left active once this point is done with it.
+                    self.bridge.set_anchor(**self.calibration.anchor_payload())
             except Exception as e:
                 self.pointFailed.emit(index, str(e))
 
         focus_fitting.finalize_region(self.fits)
         self.sequenceFinished.emit()
 
-    def _run_sweep(self, x: float, y: float, center: float, stage: dict) -> float:
+    def _run_sweep(self, row: int, col: int, center: float, stage: dict) -> float:
         """Runs one coarse/medium sweep and returns its raw max-sharpness location
         (no curve fit - that's reserved for the fine stage)."""
         z_step = stage["z_step"]
         num_layers = stage["num_layers"]
         z_start = _centered_z_start(center, z_step, num_layers)
-        metric_values = self.bridge.run_autofocus(x, y, z_start, z_step, num_layers)
+        metric_values = self.bridge.run_autofocus(row, col, z_start, z_step, num_layers)
         return _max_sharpness_z(z_start, z_step, metric_values)
 
-    def _run_fine(self, x: float, y: float, row: float, col: float, center: float) -> focus_fitting.FocusFit:
+    def _run_fine(self, row: int, col: int, orig_row: float, orig_col: float, center: float) -> focus_fitting.FocusFit:
         stage = self.stage_config["fine"]
         z_step = stage["z_step"]
         num_layers = stage["num_layers"]
         z_start = _centered_z_start(center, z_step, num_layers)
-        metric_values = self.bridge.run_autofocus(x, y, z_start, z_step, num_layers)
+        metric_values = self.bridge.run_autofocus(row, col, z_start, z_step, num_layers)
         z_values = [z_start + i * z_step for i in range(len(metric_values))]
 
-        fit = focus_fitting.FocusFit(row, col, z_values, metric_values)
+        # orig_row/orig_col (the point's true fractional location) are what get
+        # recorded, not the rounded master row/col used only to address the
+        # controller - see StageCalibration.shifted_anchor_for_focus.
+        fit = focus_fitting.FocusFit(orig_row, orig_col, z_values, metric_values)
         fit.fit()
         return fit

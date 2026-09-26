@@ -80,9 +80,10 @@ class ConfirmationScanWorker(QObject):
     captureFailed = Signal(float, str)  # z, error message
     sequenceFinished = Signal()
 
-    def __init__(self, bridge, row: int, col: int, chosen_z: float):
+    def __init__(self, bridge, calibration, row: int, col: int, chosen_z: float):
         super().__init__()
         self.bridge = bridge
+        self.calibration = calibration
         self.row = row
         self.col = col
         self.z_values = [chosen_z - _MICRON_MM, chosen_z, chosen_z + _MICRON_MM]
@@ -91,6 +92,18 @@ class ConfirmationScanWorker(QObject):
         Thread(target=self._run, daemon=True).start()
 
     def _run(self):
+        # Safety net: a prior autofocus run temporarily shifts the controller's
+        # anchor per focus point (see autofocus_client.py) and restores it right
+        # after - but a real scan must never run against a shifted anchor, so
+        # re-assert the operator's actual calibration here regardless of whatever
+        # state the controller was left in.
+        try:
+            self.bridge.set_anchor(**self.calibration.anchor_payload())
+        except Exception as e:
+            self.captureFailed.emit(self.z_values[0], f"Could not restore calibration before scanning: {e}")
+            self.sequenceFinished.emit()
+            return
+
         for z in self.z_values:
             try:
                 existing = _list_run_folders()

@@ -25,9 +25,12 @@ Y_TRANSITION_MM = pc.cSECTION_WIDTH_TO_OVERLAP_MM   # col step
 
 
 class StageCalibration:
-    def __init__(self, anchor_x: float, anchor_y: float, offset_row: int, offset_col: int):
+    def __init__(self, anchor_x: float, anchor_y: float, anchor_z: float, z_offset_correction: float,
+                 offset_row: int, offset_col: int):
         self.anchor_x = anchor_x
         self.anchor_y = anchor_y
+        self.anchor_z = anchor_z
+        self.z_offset_correction = z_offset_correction
         self.offset_row = offset_row
         self.offset_col = offset_col
 
@@ -38,6 +41,8 @@ class StageCalibration:
         return cls(
             anchor_x=cal[pc.cX],
             anchor_y=cal[pc.cY],
+            anchor_z=cal[pc.cZ],
+            z_offset_correction=cal[pc.cZO],
             offset_row=cal[pc.cROW],
             offset_col=cal[pc.cCOL],
         )
@@ -50,3 +55,28 @@ class StageCalibration:
         x = self.anchor_x + (self.offset_row + row) * X_TRANSITION_MM
         y = self.anchor_y - (self.offset_col + col) * Y_TRANSITION_MM
         return x, y
+
+    def anchor_payload(self) -> dict:
+        """This calibration's own (unshifted) anchor, as loaded - the values
+        cSET_ANCHOR_POINT_MSG needs to restore the controller to the operator's
+        real calibration after a temporary shift (see shifted_anchor_for_focus),
+        or to (re)assert it as a safety net before a real scan."""
+        return {"x": self.anchor_x, "y": self.anchor_y, "z": self.anchor_z, "z_offset": self.z_offset_correction}
+
+    def shifted_anchor_for_focus(self, row: float, col: float) -> tuple[dict, int, int]:
+        """dover_ctl2's autofocus command only actually positions correctly when
+        addressed by a whole master-grid row/column (see autofocus_client.py for
+        why) - its absolute-XY branch has a latent alignment bug. To still hit a
+        focus point sitting at a fractional row/col, this returns a temporarily
+        shifted anchor (X/Y only - Z and Z-offset pass through unchanged) such that
+        the *rounded* master row/col, addressed against this shifted anchor, lands
+        at exactly this point's true fractional location instead of that whole
+        cell's center. SectionXPosition/SectionYPosition are linear in the anchor,
+        so the shift is just the fractional remainder scaled by the per-section
+        step. The caller must restore anchor_payload() once done with this point."""
+        master_row = round(self.offset_row + row)
+        master_col = round(self.offset_col + col)
+        shifted_x = self.anchor_x + (self.offset_row + row - master_row) * X_TRANSITION_MM
+        shifted_y = self.anchor_y - (self.offset_col + col - master_col) * Y_TRANSITION_MM
+        anchor = {"x": shifted_x, "y": shifted_y, "z": self.anchor_z, "z_offset": self.z_offset_correction}
+        return anchor, master_row, master_col

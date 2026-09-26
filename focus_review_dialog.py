@@ -17,11 +17,12 @@ from confirmation_scan import ConfirmationScanWorker
 
 
 class FocusReviewDialog(QDialog):
-    def __init__(self, bridge, region_id: int, fits: list[focus_fitting.FocusFit], parent=None):
+    def __init__(self, bridge, calibration, region_id: int, fits: list[focus_fitting.FocusFit], parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Review Focus Points - Region {region_id}")
         self.resize(1000, 650)
         self.bridge = bridge
+        self.calibration = calibration
         self.fits = fits
         self.confirmed_z: dict[int, float] = {}
         self._scan_worker = None
@@ -131,7 +132,7 @@ class FocusReviewDialog(QDialog):
         self.confirm_btn.setEnabled(False)
         self._clear_capture_row()
 
-        worker = ConfirmationScanWorker(self.bridge, row=int(round(fit.row)), col=int(round(fit.col)),
+        worker = ConfirmationScanWorker(self.bridge, self.calibration, row=int(round(fit.row)), col=int(round(fit.col)),
                                          chosen_z=chosen_z)
         worker.captureReady.connect(lambda capture, idx=index: self._on_capture_ready(idx, capture))
         worker.captureFailed.connect(self._on_capture_failed)
