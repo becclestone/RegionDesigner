@@ -27,7 +27,29 @@ def section_center(row: int, col: int, anchor: tuple[float, float], zoom: float)
     return x + w / 2.0, y + h / 2.0
 
 
-def point_to_section(x: float, y: float, anchor: tuple[float, float], zoom: float) -> tuple[int, int]:
-    col = int((x - anchor[0]) / (WIDTH_STEP * zoom))
-    row = int((y - anchor[1]) / (HEIGHT_STEP * zoom))
+def point_to_section_f(x: float, y: float, anchor: tuple[float, float], zoom: float) -> tuple[float, float]:
+    """Continuous (non-truncated) row/col - used for focus points, which the user
+    wants free to sit anywhere rather than snapped to a grid cell (the physical
+    XY formula in stage_calibration.py is linear, so a fractional row/col is just
+    as valid a position as an integer one)."""
+    col = (x - anchor[0]) / (WIDTH_STEP * zoom)
+    row = (y - anchor[1]) / (HEIGHT_STEP * zoom)
     return row, col
+
+
+def point_to_section(x: float, y: float, anchor: tuple[float, float], zoom: float) -> tuple[int, int]:
+    """Truncated to a whole grid cell - used for the paintbrush, which paints
+    discrete sections."""
+    row, col = point_to_section_f(x, y, anchor, zoom)
+    return int(row), int(col)
+
+
+def point_to_section_center_f(x: float, y: float, anchor: tuple[float, float], zoom: float
+                              ) -> tuple[float, float]:
+    """Like point_to_section_f, but measured from a cell's CENTER rather than its
+    top-left corner - so a point sitting exactly at a cell's rendered center (as a
+    freshly-placed, undragged focus point does) maps back to that cell's exact
+    integer row/col, rather than landing exactly on a +0.5 rounding boundary where
+    ordinary round()/floating-point noise could resolve to either neighboring cell."""
+    row, col = point_to_section_f(x, y, anchor, zoom)
+    return row - 0.5, col - 0.5

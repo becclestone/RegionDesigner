@@ -26,8 +26,16 @@ class FocusPointItem(QGraphicsEllipseItem):
 
         self._sync_position_from_section()
 
-    def section(self) -> tuple[int, int]:
+    def section(self) -> tuple[float, float]:
+        """Continuous (row, col) - not snapped to a grid cell. Use this for
+        autofocus/physical positioning (stage_calibration.section_to_absolute_xy
+        accepts fractional row/col directly)."""
         return self._row, self._col
+
+    def grid_cell(self) -> tuple[int, int]:
+        """Nearest whole grid cell - use this wherever an actual scannable section
+        identity is needed (e.g. the single-section confirmation scan)."""
+        return int(round(self._row)), int(round(self._col))
 
     def _sync_position_from_section(self):
         x, y = geom.section_center(self._row, self._col, self.canvas.anchor, self.canvas.zoom)
@@ -35,7 +43,9 @@ class FocusPointItem(QGraphicsEllipseItem):
 
     def itemChange(self, change, value):
         if change == QGraphicsEllipseItem.GraphicsItemChange.ItemPositionHasChanged:
-            # Dragging is free/continuous (no snapping to painted cells); the
-            # section this point currently sits over is simply recomputed live.
-            self._row, self._col = geom.point_to_section(value.x(), value.y(), self.canvas.anchor, self.canvas.zoom)
+            # Dragging is free/continuous (no snapping to painted cells, and no
+            # rounding to a whole section either); the point's exact position is
+            # simply recomputed live.
+            self._row, self._col = geom.point_to_section_center_f(
+                value.x(), value.y(), self.canvas.anchor, self.canvas.zoom)
         return super().itemChange(change, value)

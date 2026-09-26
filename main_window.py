@@ -1,13 +1,20 @@
 from PySide6.QtWidgets import (
-    QMainWindow, QToolBar, QSpinBox, QPushButton, QLabel, QMessageBox
+    QMainWindow, QToolBar, QSpinBox, QDoubleSpinBox, QPushButton, QLabel, QMessageBox, QFileDialog
 )
 
 from canvas_view import SectionCanvas
 from controller_bridge import ControllerBridge
 import region_clustering as clustering
+from stage_calibration import StageCalibration
+from autofocus_client import AutofocusSequenceWorker
+from focus_review_dialog import FocusReviewDialog
+from region_plane_fit import RegionPlaneFit
 
 _DEFAULT_TARGET_REGION_SIZE = 75
 _DEFAULT_FOCUS_POINTS_PER_REGION = 4
+_DEFAULT_AF_Z_START = -0.010
+_DEFAULT_AF_Z_STEP = 0.001
+_DEFAULT_AF_NUM_LAYERS = 21
 
 
 class RegionDesignerWindow(QMainWindow):
@@ -23,7 +30,14 @@ class RegionDesignerWindow(QMainWindow):
         self.bridge.imageReady.connect(self._on_image_ready)
         self.bridge.commandError.connect(self._on_command_error)
 
+        self.calibration: StageCalibration | None = None
+        self.region_focus_points: dict[int, list[tuple[float, float, float]]] = {}  # region_id -> [(row,col,z)]
+        self.section_z: dict[tuple[int, int], float] = {}
+        self._af_worker = None
+
         self._build_toolbar()
+        self.status_label = QLabel("No calibration loaded.")
+        self.statusBar().addWidget(self.status_label)
 
         self.bridge.connect_to_controller()
 
@@ -62,6 +76,49 @@ class RegionDesignerWindow(QMainWindow):
         compile_btn.clicked.connect(self._on_compile_regions_clicked)
         toolbar.addWidget(compile_btn)
 
+        toolbar.addSeparator()
+
+        load_cal_btn = QPushButton("Load Calibration...")
+        load_cal_btn.clicked.connect(self._on_load_calibration_clicked)
+        toolbar.addWidget(load_cal_btn)
+
+        toolbar.addSeparator()
+
+        toolbar.addWidget(QLabel(" Region: "))
+        self.region_id_spin = QSpinBox()
+        self.region_id_spin.setRange(0, 9999)
+        toolbar.addWidget(self.region_id_spin)
+
+        toolbar.addWidget(QLabel(" AF Z start: "))
+        self.af_z_start_spin = QDoubleSpinBox()
+        self.af_z_start_spin.setDecimals(4)
+        self.af_z_start_spin.setRange(-10.0, 10.0)
+        self.af_z_start_spin.setSingleStep(0.001)
+        self.af_z_start_spin.setValue(_DEFAULT_AF_Z_START)
+        toolbar.addWidget(self.af_z_start_spin)
+
+        toolbar.addWidget(QLabel(" AF Z step: "))
+        self.af_z_step_spin = QDoubleSpinBox()
+        self.af_z_step_spin.setDecimals(4)
+        self.af_z_step_spin.setRange(0.0001, 1.0)
+        self.af_z_step_spin.setSingleStep(0.0005)
+        self.af_z_step_spin.setValue(_DEFAULT_AF_Z_STEP)
+        toolbar.addWidget(self.af_z_step_spin)
+
+        toolbar.addWidget(QLabel(" AF layers: "))
+        self.af_num_layers_spin = QSpinBox()
+        self.af_num_layers_spin.setRange(3, 101)
+        self.af_num_layers_spin.setValue(_DEFAULT_AF_NUM_LAYERS)
+        toolbar.addWidget(self.af_num_layers_spin)
+
+        self.run_autofocus_btn = QPushButton("Run Autofocus for Region")
+        self.run_autofocus_btn.clicked.connect(self._on_run_autofocus_clicked)
+        toolbar.addWidget(self.run_autofocus_btn)
+
+        self.fit_plane_btn = QPushButton("Fit Region Plane")
+        self.fit_plane_btn.clicked.connect(self._on_fit_plane_clicked)
+        toolbar.addWidget(self.fit_plane_btn)
+
     def _on_brush_radius_changed(self, value: int):
         self.canvas.brush_radius = value
 
@@ -94,6 +151,93 @@ class RegionDesignerWindow(QMainWindow):
         for region_id, region_sections in by_region.items():
             for row, col in clustering.place_focus_points(region_sections, num_points):
                 self.canvas.add_focus_point(region_id, row, col)
+
+    def _on_load_calibration_clicked(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select a calibration data file", "", "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            self.calibration = StageCalibration.load(path)
+            self.status_label.setText(f"Calibration loaded: {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Load Calibration", f"Could not load calibration: {e}")
+
+    def _on_run_autofocus_clicked(self):
+        if self.calibration is None:
+            QMessageBox.warning(self, "Run Autofocus", "Load a calibration file first.")
+            return
+        if self.bridge.is_busy():
+            QMessageBox.warning(self, "Run Autofocus", "Another hardware operation is already in progress.")
+            return
+
+        region_id = self.region_id_spin.value()
+        points = self.canvas.focus_points_by_region().get(region_id)
+        if not points:
+            QMessageBox.information(self, "Run Autofocus", f"No focus points found for region {region_id}.")
+            return
+
+        self.run_autofocus_btn.setEnabled(False)
+        self.status_label.setText(f"Running autofocus for region {region_id}: 0/{len(points)}")
+
+        worker = AutofocusSequenceWorker(
+            self.bridge, self.calibration, points,
+            z_start=self.af_z_start_spin.value(),
+            z_step=self.af_z_step_spin.value(),
+            num_layers=self.af_num_layers_spin.value(),
+        )
+        worker.pointStarted.connect(self._on_autofocus_point_started)
+        worker.pointFailed.connect(self._on_autofocus_point_failed)
+        worker.sequenceFinished.connect(lambda: self._on_autofocus_sequence_finished(region_id, worker))
+        self._af_worker = worker  # keep alive for the duration of the sequence
+        worker.start()
+
+    def _on_autofocus_point_started(self, index: int, total: int):
+        self.status_label.setText(f"Running autofocus: point {index + 1}/{total}")
+
+    def _on_autofocus_point_failed(self, index: int, message: str):
+        QMessageBox.warning(self, "Autofocus failed", f"Point {index}: {message}")
+
+    def _on_autofocus_sequence_finished(self, region_id: int, worker: AutofocusSequenceWorker):
+        self.run_autofocus_btn.setEnabled(True)
+        self.status_label.setText(f"Autofocus done for region {region_id}: {len(worker.fits)} point(s) fitted.")
+
+        if not worker.fits:
+            return
+
+        dialog = FocusReviewDialog(self.bridge, region_id, worker.fits, parent=self)
+        if dialog.exec() == FocusReviewDialog.DialogCode.Accepted:
+            self.region_focus_points[region_id] = dialog.result_focus_points()
+            self.status_label.setText(
+                f"Region {region_id}: {len(self.region_focus_points[region_id])} focus point(s) confirmed."
+            )
+
+    def _on_fit_plane_clicked(self):
+        region_id = self.region_id_spin.value()
+        focus_points = self.region_focus_points.get(region_id)
+        if not focus_points:
+            QMessageBox.information(
+                self, "Fit Region Plane",
+                f"Run autofocus and confirm region {region_id}'s focus points first.",
+            )
+            return
+
+        region_sections = [s for s, rid in self.canvas.region_of.items() if rid == region_id]
+        if not region_sections:
+            QMessageBox.information(self, "Fit Region Plane", f"No painted sections found for region {region_id}.")
+            return
+
+        try:
+            plane = RegionPlaneFit(focus_points)
+        except ValueError as e:
+            QMessageBox.warning(self, "Fit Region Plane", str(e))
+            return
+
+        self.section_z.update(plane.fill_sections(region_sections))
+        residuals = plane.residuals()
+        self.status_label.setText(
+            f"Region {region_id}: plane fit over {len(region_sections)} section(s), "
+            f"max focus-point residual = {max(residuals):.4f}mm."
+        )
 
     def closeEvent(self, event):
         self.bridge.shutdown()

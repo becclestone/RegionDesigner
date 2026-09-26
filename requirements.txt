@@ -3,3 +3,5 @@ stomp.py
 scikit-learn
 numpy
 scipy
+tifffile
+matplotlib

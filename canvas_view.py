@@ -150,8 +150,10 @@ class SectionCanvas(QGraphicsView):
         self.focus_point_items.append(item)
         return item
 
-    def focus_points_by_region(self) -> dict[int, list[Section]]:
-        out: dict[int, list[Section]] = {}
+    def focus_points_by_region(self) -> dict[int, list[tuple[float, float]]]:
+        """Continuous (row, col) per point (see FocusPointItem.section) - not the
+        integer Section alias used for painted grid cells."""
+        out: dict[int, list[tuple[float, float]]] = {}
         for item in self.focus_point_items:
             out.setdefault(item.region_id, []).append(item.section())
         return out
