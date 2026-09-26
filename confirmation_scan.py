@@ -21,6 +21,14 @@ from PySide6.QtCore import QObject, Signal
 IMAGES_ROOT = os.path.expanduser("~/Development/ILLUMISONICS/Gander/IMAGES")
 _MICRON_MM = 0.001
 
+# The reconstruction/save pipeline writes the NR tif some time after the scan
+# itself reports cPATH_UPDATE_MSG complete - observed delay is up to ~20s, so the
+# run folder can exist (and its NR subfolder be empty) for a while before the file
+# actually lands. Poll for the file itself rather than failing the moment the
+# folder appears.
+_IMAGE_APPEAR_TIMEOUT_S = 30.0
+_IMAGE_APPEAR_POLL_INTERVAL_S = 1.0
+
 
 @dataclass
 class ScanCapture:
@@ -47,8 +55,22 @@ def _wait_for_new_run_folder(existing: set, timeout: float = 30.0, poll_interval
     raise TimeoutError("Scan completed but no new output folder appeared under IMAGES_ROOT.")
 
 
+def _wait_for_file(path: str, timeout: float = _IMAGE_APPEAR_TIMEOUT_S,
+                    poll_interval: float = _IMAGE_APPEAR_POLL_INTERVAL_S) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.isfile(path):
+            return
+        time.sleep(poll_interval)
+    raise TimeoutError(
+        f"Timed out after {timeout:.0f}s waiting for {path} to appear "
+        f"(scan completed but the reconstruction/save pipeline may still be running)."
+    )
+
+
 def score_nr_image(run_folder: str, row: int, col: int) -> tuple:
     image_path = os.path.join(run_folder, "NR", f"s-{row}-{col}_nr_float32.tif")
+    _wait_for_file(image_path)
     image = tifffile.imread(image_path)
     return image_path, float(np.percentile(image, 99))
 
