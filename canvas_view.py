@@ -5,7 +5,7 @@ for a large brushed area and would bog the scene down). Instead a single offscre
 QImage mask is redrawn on each brush stroke and shown through one QGraphicsPixmapItem.
 """
 from PySide6.QtCore import Qt, QRectF, Signal
-from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QMouseEvent
+from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
 import grid_geometry as geom
@@ -31,9 +31,17 @@ class SectionCanvas(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setMouseTracking(True)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
 
         self.anchor: tuple[float, float] = (0.0, 0.0)
         self.zoom: float = 1.0
+
+        self._view_scale = 1.0
+        self._view_scale_min = 0.05
+        self._view_scale_max = 40.0
+        self._panning = False
+        self._pan_last_pos = None
 
         self.background_item: QGraphicsPixmapItem | None = None
         self.mask_image: QImage | None = None
@@ -68,8 +76,33 @@ class SectionCanvas(QGraphicsView):
         self.mask_item.setZValue(0)
         self._scene.addItem(self.mask_item)
 
+    # ---- zoom (scroll wheel) / pan (middle click drag) ----
+    def wheelEvent(self, event: QWheelEvent):
+        if self.background_item is None:
+            super().wheelEvent(event)
+            return
+
+        steps = event.angleDelta().y() / 120.0
+        if steps == 0:
+            return
+        factor = 1.25 ** steps
+        new_scale = self._view_scale * factor
+        new_scale = max(self._view_scale_min, min(self._view_scale_max, new_scale))
+        factor = new_scale / self._view_scale
+        if factor == 1.0:
+            return
+        self._view_scale = new_scale
+        self.scale(factor, factor)
+        event.accept()
+
     # ---- mouse handling: paint, or forward to Qt's item-drag for focus points ----
     def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._pan_last_pos = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+
         if self.mask_image is None:
             super().mousePressEvent(event)
             return
@@ -88,12 +121,27 @@ class SectionCanvas(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        if self._panning:
+            delta = event.position() - self._pan_last_pos
+            self._pan_last_pos = event.position()
+            h_bar = self.horizontalScrollBar()
+            v_bar = self.verticalScrollBar()
+            h_bar.setValue(h_bar.value() - int(delta.x()))
+            v_bar.setValue(v_bar.value() - int(delta.y()))
+            return
+
         if self._painting:
             self._paint_at(event.position())
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.MiddleButton and self._panning:
+            self._panning = False
+            self._pan_last_pos = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+
         if self._painting:
             self._painting = False
             self.sectionsChanged.emit()

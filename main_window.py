@@ -1,3 +1,6 @@
+import glob
+import os
+
 from PySide6.QtWidgets import (
     QMainWindow, QToolBar, QSpinBox, QDoubleSpinBox, QPushButton, QLabel, QMessageBox, QFileDialog
 )
@@ -15,6 +18,22 @@ _DEFAULT_FOCUS_POINTS_PER_REGION = 4
 _DEFAULT_AF_Z_START = -0.010
 _DEFAULT_AF_Z_STEP = 0.001
 _DEFAULT_AF_NUM_LAYERS = 21
+
+# DOVER_UI is a sibling checkout that already carries the operator's calibration
+# (Stage Calibration tab, saved to its saved-calibration/ folder). Auto-loading its
+# most recent save here means the region designer starts out already calibrated,
+# since the calibration is stage state that rarely changes and shouldn't need to be
+# re-picked every session.
+_DOVER_UI_CALIBRATION_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "DOVER_UI", "saved-calibration"
+)
+
+
+def _find_default_calibration_path() -> str | None:
+    candidates = glob.glob(os.path.join(_DOVER_UI_CALIBRATION_DIR, "*.json"))
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
 
 
 class RegionDesignerWindow(QMainWindow):
@@ -39,7 +58,19 @@ class RegionDesignerWindow(QMainWindow):
         self.status_label = QLabel("No calibration loaded.")
         self.statusBar().addWidget(self.status_label)
 
+        self._load_default_calibration()
+
         self.bridge.connect_to_controller()
+
+    def _load_default_calibration(self):
+        path = _find_default_calibration_path()
+        if path is None:
+            return
+        try:
+            self.calibration = StageCalibration.load(path)
+            self.status_label.setText(f"Calibration loaded (default from DOVER_UI): {os.path.basename(path)}")
+        except Exception:
+            pass  # keep "No calibration loaded."; the toolbar button still lets the user load one manually
 
     def _build_toolbar(self):
         toolbar = QToolBar("Tools", self)
