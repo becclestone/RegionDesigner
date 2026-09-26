@@ -8,6 +8,7 @@ The brush itself paints a free-form circular stroke in continuous scene (image)
 space while the mouse is down - the stroke is only converted into the discrete
 painted-section set once the mouse button is released.
 """
+from PIL import Image as PILImage
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal
 from PySide6.QtGui import (
     QImage, QPixmap, QPainter, QColor, QPen, QFont, QMouseEvent, QWheelEvent,
@@ -17,11 +18,35 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsPathItem, QGraphicsEllipseItem,
 )
 
+from Constants import project_constants as pc
 import grid_geometry as geom
 from focus_point_item import FocusPointItem
 from region_colors import region_color
 
 Section = tuple[int, int]
+
+# Mirrors DOVER_UI/Windows/demo_control_a.py's load_image_at_path image prep - minus its
+# 0.5x scale-down (RegionDesigner keeps the full-resolution image) - so a section painted
+# here lines up with the physical grid the same way DOVER_UI's does: correct the fixed
+# camera-mount tilt, flip to the grid's row-down convention, then crop to the sensor's
+# usable region. The crop box is 2x demo_control_a.py's _CROP_LEFT/_CROP_TOP/_CROP_RIGHT/
+# _CROP_BOTTOM, which are defined in its half-resolution display image's pixel space.
+_CROP_BOX = (42, 1050, 4918, 2950)  # (left, top, right, bottom)
+
+
+def _load_registered_image(path: str) -> PILImage.Image:
+    image = PILImage.open(path).rotate(pc.cCAM_CCW_ROT_DEG)
+    image = image.transpose(PILImage.Transpose.FLIP_TOP_BOTTOM)
+    return image.crop(_CROP_BOX)
+
+
+def _pil_to_qpixmap(image: PILImage.Image) -> QPixmap:
+    image = image.convert("RGB")
+    data = image.tobytes("raw", "RGB")
+    qimage = QImage(data, image.width, image.height, image.width * 3, QImage.Format.Format_RGB888)
+    qimage = qimage.copy()  # detach from the PIL buffer before it's garbage collected
+    return QPixmap.fromImage(qimage)
+
 
 _PAINTED_COLOR = QColor(30, 144, 255, 110)
 _REGION_OUTLINE_WIDTH = 3
@@ -49,7 +74,7 @@ class SectionCanvas(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
 
-        self.anchor: tuple[float, float] = (0.0, 0.0)
+        self.anchor: tuple[float, float] = geom.DEFAULT_ANCHOR_PX
         self.zoom: float = 1.0
 
         self._view_scale = 1.0
@@ -78,7 +103,7 @@ class SectionCanvas(QGraphicsView):
 
     # ---- background image ----
     def set_background_image(self, path: str):
-        pixmap = QPixmap(path)
+        pixmap = _pil_to_qpixmap(_load_registered_image(path))
         if self.background_item is not None:
             self._scene.removeItem(self.background_item)
         self.background_item = QGraphicsPixmapItem(pixmap)

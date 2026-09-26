@@ -7,11 +7,21 @@ Kept free of any GUI-toolkit dependency so it can be reused/tested standalone.
 """
 from Constants import project_constants as pc
 
-WIDTH_STEP = pc.cSCALED_SECTION_WIDTH_TO_OVERLAP_PIXEL_COUNT
-HEIGHT_STEP = pc.cSCALED_SECTION_HEIGHT_TO_OVERLAP_PIXEL_COUNT
+# Unscaled (full-resolution) step sizes - unlike demo_control_a.py's own display image,
+# RegionDesigner's background image skips the 0.5x scale-down (see canvas_view.py's
+# set_background_image), so the *_SCALED_* constants (already *0.5) would be wrong here.
+WIDTH_STEP = pc.cSECTION_WIDTH_TO_OVERLAP_PIXEL_COUNT
+HEIGHT_STEP = pc.cSECTION_HEIGHT_TO_OVERLAP_PIXEL_COUNT
 
 MASTER_ROW_COUNT = pc.cMASTER_ROW_COUNT
 MASTER_COL_COUNT = pc.cMASTER_COL_COUNT
+
+# Mirrors demo_control_a.py's default _ANCHOR_POINT = (566, 6) - the pixel, on its
+# processed display image, that the operator has registered as section (0, 0)'s corner
+# (via "Select Grid Anchor"; this default is what's in effect unless they've re-picked one).
+# That image is the 0.5x-scaled-down one, so the same physical pixel is at 2x these
+# coordinates on RegionDesigner's full-resolution image.
+DEFAULT_ANCHOR_PX = (566.0 * 2.0, 6.0 * 2.0)
 
 
 def section_to_pixel_rect(row: int, col: int, anchor: tuple[float, float], zoom: float
