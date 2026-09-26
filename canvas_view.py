@@ -67,7 +67,7 @@ class SectionCanvas(QGraphicsView):
         self.draw_mode = True  # False once regions are compiled - brush is inactive until cleared
         self.active_region_id: int | None = None  # region currently being scanned - drawn highlighted
 
-        self.brush_radius = 2  # radius in section-width units (true circular radius in scene pixels)
+        self.brush_radius = 6  # radius in section-width units (true circular radius in scene pixels)
         self._painting = False
         self._erase_mode = False
         self._stroke_path: QPainterPath | None = None

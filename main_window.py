@@ -178,9 +178,15 @@ class RegionDesignerWindow(QMainWindow):
         self.canvas.apply_regions(region_of)
         self.canvas.clear_focus_points()
 
+        # Tissue is usually overselected a bit, so keep focus points off the outer
+        # ~1mm rim of the painted area; fall back to the full region if that leaves
+        # it with nothing (e.g. a region that sits entirely on that rim).
+        interior_sections = clustering.sections_away_from_edge(sections)
+
         num_points = self.focus_points_spin.value()
         for region_id, region_sections in by_region.items():
-            for row, col in clustering.place_focus_points(region_sections, num_points):
+            candidates = [s for s in region_sections if s in interior_sections] or region_sections
+            for row, col in clustering.place_focus_points(candidates, num_points):
                 self.canvas.add_focus_point(region_id, row, col)
 
         # region_id already runs 0..N-1 in the clustering's serpentine scan order

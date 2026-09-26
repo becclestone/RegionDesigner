@@ -6,8 +6,11 @@ rather than reimplementing it. Pure data in/out - no Qt or controller dependency
 """
 import numpy as np
 from sklearn.cluster import KMeans
+from scipy.ndimage import distance_transform_edt
 from scipy.spatial.distance import cdist
 from scipy.optimize import linear_sum_assignment
+
+from Constants import project_constants as pc
 
 Section = tuple[int, int]
 
@@ -16,6 +19,15 @@ Section = tuple[int, int]
 # 5:2 weighting already used in region_planner_V2.gen_region_path.
 ROW_SCALE = 5.0
 COL_SCALE = 2.0
+
+# Real (not aspect-only) per-section step sizes, for converting an edge-exclusion
+# margin from mm to grid units accurately.
+ROW_STEP_MM = pc.cSECTION_HEIGHT_TO_OVERLAP_MM
+COL_STEP_MM = pc.cSECTION_WIDTH_TO_OVERLAP_MM
+
+# Operators typically overselect the tissue when painting, so the painted boundary
+# runs a bit past the true sample edge - keep focus points off this outer rim.
+EDGE_EXCLUSION_MM = 1.0
 
 
 def _scale(sections: np.ndarray) -> np.ndarray:
@@ -58,6 +70,34 @@ def assign_regions(sections: list[Section], target_region_size: int) -> dict[Sec
     cluster_size = max(1, min(target_region_size, len(sections)))
     labels = _get_even_clusters(xy_scaled, cluster_size)
     return {sections[i]: int(labels[i]) for i in range(len(sections))}
+
+
+def sections_away_from_edge(sections: list[Section], margin_mm: float = EDGE_EXCLUSION_MM) -> set[Section]:
+    """Returns the subset of painted sections at least margin_mm from the outer
+    boundary of the full painted area (not any one region - a region's own edge
+    can be an interior cut between regions, not the sample's true edge)."""
+    if margin_mm <= 0 or not sections:
+        return set(sections)
+
+    rows = [r for r, _ in sections]
+    cols = [c for _, c in sections]
+    row_min, col_min = min(rows), min(cols)
+
+    mask = np.zeros((max(rows) - row_min + 1, max(cols) - col_min + 1), dtype=bool)
+    for r, c in sections:
+        mask[r - row_min, c - col_min] = True
+
+    # Pad with unpainted border so sections on the painted bounding box's edge are
+    # measured against the true outside, not clipped at the mask array's border.
+    pad_rows = int(np.ceil(margin_mm / ROW_STEP_MM)) + 1
+    pad_cols = int(np.ceil(margin_mm / COL_STEP_MM)) + 1
+    padded = np.pad(mask, ((pad_rows, pad_rows), (pad_cols, pad_cols)), constant_values=False)
+
+    dist_mm = distance_transform_edt(padded, sampling=(ROW_STEP_MM, COL_STEP_MM))
+    return {
+        (r, c) for r, c in sections
+        if dist_mm[r - row_min + pad_rows, c - col_min + pad_cols] >= margin_mm
+    }
 
 
 def place_focus_points(region_sections: list[Section], num_points: int) -> list[Section]:
