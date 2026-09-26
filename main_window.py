@@ -105,6 +105,10 @@ class RegionDesignerWindow(QMainWindow):
         compile_btn.clicked.connect(self._on_compile_regions_clicked)
         toolbar.addWidget(compile_btn)
 
+        clear_regions_btn = QPushButton("Clear Regions")
+        clear_regions_btn.clicked.connect(self._on_clear_regions_clicked)
+        toolbar.addWidget(clear_regions_btn)
+
         toolbar.addSeparator()
 
         load_cal_btn = QPushButton("Load Calibration...")
@@ -113,10 +117,19 @@ class RegionDesignerWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        toolbar.addWidget(QLabel(" Region: "))
+        toolbar.addWidget(QLabel(" Region (scan order): "))
         self.region_id_spin = QSpinBox()
         self.region_id_spin.setRange(0, 9999)
+        self.region_id_spin.valueChanged.connect(self._on_region_id_changed)
         toolbar.addWidget(self.region_id_spin)
+
+        prev_region_btn = QPushButton("< Prev")
+        prev_region_btn.clicked.connect(lambda: self.region_id_spin.stepBy(-1))
+        toolbar.addWidget(prev_region_btn)
+
+        next_region_btn = QPushButton("Next >")
+        next_region_btn.clicked.connect(lambda: self.region_id_spin.stepBy(1))
+        toolbar.addWidget(next_region_btn)
 
         toolbar.addWidget(QLabel(" AF Z start (initial guess): "))
         self.af_z_start_spin = QDoubleSpinBox()
@@ -136,6 +149,9 @@ class RegionDesignerWindow(QMainWindow):
 
     def _on_brush_radius_changed(self, value: int):
         self.canvas.brush_radius = value
+
+    def _on_region_id_changed(self, value: int):
+        self.canvas.set_active_region(value)
 
     def _on_snap_clicked(self):
         self.bridge.request_snap()
@@ -166,6 +182,17 @@ class RegionDesignerWindow(QMainWindow):
         for region_id, region_sections in by_region.items():
             for row, col in clustering.place_focus_points(region_sections, num_points):
                 self.canvas.add_focus_point(region_id, row, col)
+
+        # region_id already runs 0..N-1 in the clustering's serpentine scan order
+        # (region_clustering.assign_regions) - bound the spinbox to it and default
+        # to region 0 so the operator starts at the beginning of that order.
+        self.region_id_spin.setMaximum(max(by_region.keys()))
+        self.region_id_spin.setValue(0)
+        self.canvas.set_active_region(0)
+
+    def _on_clear_regions_clicked(self):
+        self.canvas.clear_regions()
+        self.region_id_spin.setMaximum(9999)
 
     def _on_load_calibration_clicked(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select a calibration data file", "", "JSON Files (*.json)")

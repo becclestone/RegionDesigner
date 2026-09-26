@@ -10,7 +10,7 @@ painted-section set once the mouse button is released.
 """
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal
 from PySide6.QtGui import (
-    QImage, QPixmap, QPainter, QColor, QPen, QMouseEvent, QWheelEvent,
+    QImage, QPixmap, QPainter, QColor, QPen, QFont, QMouseEvent, QWheelEvent,
     QPainterPath, QPainterPathStroker,
 )
 from PySide6.QtWidgets import (
@@ -25,10 +25,15 @@ Section = tuple[int, int]
 
 _PAINTED_COLOR = QColor(30, 144, 255, 110)
 _REGION_OUTLINE_WIDTH = 3
+_ACTIVE_REGION_OUTLINE_WIDTH = 6
+_ACTIVE_REGION_OUTLINE_COLOR = QColor(255, 255, 255)
 
 _STROKE_PAINT_COLOR = QColor(30, 144, 255, 150)
 _STROKE_ERASE_COLOR = QColor(220, 60, 60, 150)
 _BRUSH_CURSOR_COLOR = QColor(255, 255, 255, 220)
+
+_LABEL_TEXT_COLOR = QColor(255, 255, 255)
+_LABEL_BG_COLOR = QColor(0, 0, 0, 170)
 
 
 class SectionCanvas(QGraphicsView):
@@ -59,6 +64,8 @@ class SectionCanvas(QGraphicsView):
 
         self.painted: set[Section] = set()
         self.region_of: dict[Section, int] = {}
+        self.draw_mode = True  # False once regions are compiled - brush is inactive until cleared
+        self.active_region_id: int | None = None  # region currently being scanned - drawn highlighted
 
         self.brush_radius = 2  # radius in section-width units (true circular radius in scene pixels)
         self._painting = False
@@ -116,7 +123,7 @@ class SectionCanvas(QGraphicsView):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
 
-        if self.mask_image is None:
+        if self.mask_image is None or not self.draw_mode:
             super().mousePressEvent(event)
             return
 
@@ -179,7 +186,8 @@ class SectionCanvas(QGraphicsView):
             self._brush_cursor_item.setVisible(False)
 
     def _update_brush_cursor(self, view_pos):
-        if self.mask_image is None:
+        if self.mask_image is None or not self.draw_mode:
+            self._hide_brush_cursor()
             return
         scene_pos = self.mapToScene(view_pos.toPoint())
         radius_px = self._brush_radius_px()
@@ -276,6 +284,7 @@ class SectionCanvas(QGraphicsView):
     def _redraw_mask(self):
         self.mask_image.fill(Qt.GlobalColor.transparent)
         painter = QPainter(self.mask_image)
+        region_centroid_sum: dict[int, list[float]] = {}  # region_id -> [sum_x, sum_y, count]
         for (row, col) in self.painted:
             region_id = self.region_of.get((row, col))
             if region_id is None:
@@ -284,12 +293,23 @@ class SectionCanvas(QGraphicsView):
                 painter.fillRect(QRectF(x, y, w, h), _PAINTED_COLOR)
                 continue
 
-            # Clustered into a region - leave the interior transparent and only
-            # stroke the edges that border a different region (or empty space),
-            # so the outline traces the region's outer shape rather than every cell.
-            pen = QPen(region_color(region_id), _REGION_OUTLINE_WIDTH)
-            painter.setPen(pen)
             x, y, w, h = geom.section_to_pixel_rect(row, col, self.anchor, self.zoom)
+            entry = region_centroid_sum.setdefault(region_id, [0.0, 0.0, 0])
+            entry[0] += x + w / 2.0
+            entry[1] += y + h / 2.0
+            entry[2] += 1
+
+            # Leave the interior transparent and only stroke the edges that border
+            # a different region (or empty space), so the outline traces the
+            # region's outer shape rather than every cell - the active region gets
+            # a thicker, distinctly-colored outline instead of any fill, so focus
+            # points already placed inside it stay easy to see.
+            is_active = region_id == self.active_region_id
+            pen = QPen(
+                _ACTIVE_REGION_OUTLINE_COLOR if is_active else region_color(region_id),
+                _ACTIVE_REGION_OUTLINE_WIDTH if is_active else _REGION_OUTLINE_WIDTH,
+            )
+            painter.setPen(pen)
             for (dr, dc, x1, y1, x2, y2) in (
                 (-1, 0, x, y, x + w, y),          # top
                 (1, 0, x, y + h, x + w, y + h),   # bottom
@@ -298,12 +318,58 @@ class SectionCanvas(QGraphicsView):
             ):
                 if self.region_of.get((row + dr, col + dc)) != region_id:
                     painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        for region_id, (sum_x, sum_y, count) in region_centroid_sum.items():
+            self._draw_region_label(painter, region_id, sum_x / count, sum_y / count)
+
         painter.end()
         self.mask_item.setPixmap(QPixmap.fromImage(self.mask_image))
+
+    def _draw_region_label(self, painter: QPainter, region_id: int, cx: float, cy: float):
+        """Draws the region's scan-order number (its region_id, which clustering
+        already assigns in serpentine scan order) at the region's centroid, so the
+        operator can read the intended scan order straight off the canvas."""
+        text = str(region_id)
+        font = QFont()
+        font.setPointSizeF(12.0)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        text_rect = metrics.boundingRect(text)
+        padding = 4
+        bg_rect = QRectF(
+            cx - text_rect.width() / 2.0 - padding, cy - text_rect.height() / 2.0 - padding,
+            text_rect.width() + padding * 2, text_rect.height() + padding * 2,
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_LABEL_BG_COLOR)
+        painter.drawRoundedRect(bg_rect, 3, 3)
+        painter.setPen(_LABEL_TEXT_COLOR)
+        painter.drawText(bg_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def set_active_region(self, region_id: int | None):
+        """Marks the given region as the one currently being scanned - drawn with a
+        filled highlight and a thicker outline so it stands out from the rest."""
+        if region_id == self.active_region_id:
+            return
+        self.active_region_id = region_id
+        if self.mask_image is not None:
+            self._redraw_mask()
 
     # ---- regions / focus points ----
     def apply_regions(self, region_of: dict[Section, int]):
         self.region_of = region_of
+        self.draw_mode = False
+        self._hide_brush_cursor()
+        self._redraw_mask()
+
+    def clear_regions(self):
+        """Undo compilation: drop region assignments/focus points and go back to
+        free-form brush painting of self.painted."""
+        self.region_of = {}
+        self.draw_mode = True
+        self.active_region_id = None
+        self.clear_focus_points()
         self._redraw_mask()
 
     def clear_focus_points(self):
