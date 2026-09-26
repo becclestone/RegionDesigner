@@ -1,0 +1,3 @@
+[submodule "IsMsgPy"]
+	path = IsMsgPy
+	url = https://github.com/illumiSonics/IsMsgPy.git

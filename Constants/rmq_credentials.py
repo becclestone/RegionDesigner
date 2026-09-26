@@ -1,0 +1,6 @@
+PORT = 61613
+HOST = "10.0.0.10"
+HOSTS_AND_PORTS = [(HOST, PORT)]
+VHOST_NAME = "gander"
+USER_NAME = "dover_ui"
+USER_PASSCODE = "gander"
