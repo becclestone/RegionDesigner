@@ -3,10 +3,11 @@ from PySide6.QtGui import QBrush, QPen, QColor
 from PySide6.QtWidgets import QGraphicsEllipseItem
 
 import grid_geometry as geom
+from region_colors import region_color
 
 _RADIUS_PX = 6.0
 _FILL_COLOR = QColor(255, 255, 255, 235)
-_BORDER_COLOR = QColor(20, 20, 20, 235)
+_BORDER_WIDTH = 2.0
 
 
 class FocusPointItem(QGraphicsEllipseItem):
@@ -18,7 +19,7 @@ class FocusPointItem(QGraphicsEllipseItem):
         self._col = col
 
         self.setBrush(QBrush(_FILL_COLOR))
-        self.setPen(QPen(_BORDER_COLOR, 1.5))
+        self.setPen(QPen(region_color(region_id), _BORDER_WIDTH))
         self.setZValue(10)
         self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIsSelectable, True)

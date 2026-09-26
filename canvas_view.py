@@ -3,22 +3,32 @@
 Painted sections are NOT rendered as one QGraphicsItem each (could be thousands
 for a large brushed area and would bog the scene down). Instead a single offscreen
 QImage mask is redrawn on each brush stroke and shown through one QGraphicsPixmapItem.
+
+The brush itself paints a free-form circular stroke in continuous scene (image)
+space while the mouse is down - the stroke is only converted into the discrete
+painted-section set once the mouse button is released.
 """
-from PySide6.QtCore import Qt, QRectF, Signal
-from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QMouseEvent, QWheelEvent
-from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
+from PySide6.QtCore import Qt, QPointF, QRectF, Signal
+from PySide6.QtGui import (
+    QImage, QPixmap, QPainter, QColor, QPen, QMouseEvent, QWheelEvent,
+    QPainterPath, QPainterPathStroker,
+)
+from PySide6.QtWidgets import (
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsPathItem, QGraphicsEllipseItem,
+)
 
 import grid_geometry as geom
 from focus_point_item import FocusPointItem
+from region_colors import region_color
 
 Section = tuple[int, int]
 
 _PAINTED_COLOR = QColor(30, 144, 255, 110)
-_REGION_PALETTE = [
-    QColor(230, 25, 75, 150), QColor(60, 180, 75, 150), QColor(255, 225, 25, 150),
-    QColor(0, 130, 200, 150), QColor(245, 130, 48, 150), QColor(145, 30, 180, 150),
-    QColor(70, 240, 240, 150), QColor(240, 50, 230, 150),
-]
+_REGION_OUTLINE_WIDTH = 3
+
+_STROKE_PAINT_COLOR = QColor(30, 144, 255, 150)
+_STROKE_ERASE_COLOR = QColor(220, 60, 60, 150)
+_BRUSH_CURSOR_COLOR = QColor(255, 255, 255, 220)
 
 
 class SectionCanvas(QGraphicsView):
@@ -50,9 +60,12 @@ class SectionCanvas(QGraphicsView):
         self.painted: set[Section] = set()
         self.region_of: dict[Section, int] = {}
 
-        self.brush_radius = 2  # radius in section units
+        self.brush_radius = 2  # radius in section-width units (true circular radius in scene pixels)
         self._painting = False
         self._erase_mode = False
+        self._stroke_path: QPainterPath | None = None
+        self._stroke_preview_item: QGraphicsPathItem | None = None
+        self._brush_cursor_item: QGraphicsEllipseItem | None = None
 
         self.focus_point_items: list[FocusPointItem] = []
 
@@ -115,7 +128,7 @@ class SectionCanvas(QGraphicsView):
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             self._erase_mode = event.button() == Qt.MouseButton.RightButton
             self._painting = True
-            self._paint_at(event.position())
+            self._start_stroke(event.position())
             return
 
         super().mousePressEvent(event)
@@ -131,8 +144,10 @@ class SectionCanvas(QGraphicsView):
             return
 
         if self._painting:
-            self._paint_at(event.position())
+            self._extend_stroke(event.position())
             return
+
+        self._update_brush_cursor(event.position())
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
@@ -144,21 +159,108 @@ class SectionCanvas(QGraphicsView):
 
         if self._painting:
             self._painting = False
+            self._finish_stroke()
             self.sectionsChanged.emit()
             return
         super().mouseReleaseEvent(event)
 
-    def _paint_at(self, view_pos):
+    def leaveEvent(self, event):
+        self._hide_brush_cursor()
+        super().leaveEvent(event)
+
+    # ---- free-form circular brush: paint in continuous scene space, convert on release ----
+    def _brush_radius_px(self) -> float:
+        """True circular radius in scene-pixel space (independent of the row/col
+        step asymmetry that made the old grid-space brush paint an ellipse)."""
+        return max(self.brush_radius, 0.5) * geom.WIDTH_STEP * self.zoom
+
+    def _hide_brush_cursor(self):
+        if self._brush_cursor_item is not None:
+            self._brush_cursor_item.setVisible(False)
+
+    def _update_brush_cursor(self, view_pos):
+        if self.mask_image is None:
+            return
         scene_pos = self.mapToScene(view_pos.toPoint())
-        center_row, center_col = geom.point_to_section(scene_pos.x(), scene_pos.y(), self.anchor, self.zoom)
+        radius_px = self._brush_radius_px()
+        if self._brush_cursor_item is None:
+            self._brush_cursor_item = QGraphicsEllipseItem()
+            self._brush_cursor_item.setZValue(5)
+            pen = QPen(_BRUSH_CURSOR_COLOR, 1.5)
+            pen.setCosmetic(True)
+            self._brush_cursor_item.setPen(pen)
+            self._brush_cursor_item.setBrush(Qt.BrushStyle.NoBrush)
+            self._scene.addItem(self._brush_cursor_item)
+        self._brush_cursor_item.setRect(
+            scene_pos.x() - radius_px, scene_pos.y() - radius_px, radius_px * 2, radius_px * 2
+        )
+        self._brush_cursor_item.setVisible(True)
+
+    def _start_stroke(self, view_pos):
+        self._hide_brush_cursor()
+        scene_pos = self.mapToScene(view_pos.toPoint())
+        self._stroke_path = QPainterPath(scene_pos)
+        self._update_stroke_preview()
+
+    def _extend_stroke(self, view_pos):
+        scene_pos = self.mapToScene(view_pos.toPoint())
+        self._stroke_path.lineTo(scene_pos)
+        self._update_stroke_preview()
+
+    def _stroke_outline(self, stroke_path: QPainterPath) -> QPainterPath:
+        """Filled geometry of the swept brush footprint. QPainterPath collapses a
+        zero-length lineTo (a plain click with no drag), so QPainterPathStroker
+        can't be relied on to turn that degenerate case into a circle - build the
+        circle explicitly instead."""
+        radius_px = self._brush_radius_px()
+        if stroke_path.elementCount() < 2:
+            start = stroke_path.elementAt(0)
+            outline = QPainterPath()
+            outline.addEllipse(QPointF(start.x, start.y), radius_px, radius_px)
+            return outline
+
+        stroker = QPainterPathStroker()
+        stroker.setWidth(radius_px * 2)
+        stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+        stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        return stroker.createStroke(stroke_path)
+
+    def _update_stroke_preview(self):
+        if self._stroke_preview_item is None:
+            self._stroke_preview_item = QGraphicsPathItem()
+            self._stroke_preview_item.setZValue(5)
+            self._stroke_preview_item.setPen(Qt.PenStyle.NoPen)
+            self._scene.addItem(self._stroke_preview_item)
+        color = _STROKE_ERASE_COLOR if self._erase_mode else _STROKE_PAINT_COLOR
+        self._stroke_preview_item.setBrush(color)
+        self._stroke_preview_item.setPath(self._stroke_outline(self._stroke_path))
+
+    def _finish_stroke(self):
+        if self._stroke_preview_item is not None:
+            self._scene.removeItem(self._stroke_preview_item)
+            self._stroke_preview_item = None
+        stroke_path = self._stroke_path
+        self._stroke_path = None
+        if stroke_path is not None:
+            self._apply_stroke_to_sections(stroke_path)
+
+    def _apply_stroke_to_sections(self, stroke_path: QPainterPath):
+        outline = self._stroke_outline(stroke_path)
+
+        bounds = outline.boundingRect()
+        if bounds.isEmpty():
+            return
+
+        min_row, min_col = geom.point_to_section(bounds.left(), bounds.top(), self.anchor, self.zoom)
+        max_row, max_col = geom.point_to_section(bounds.right(), bounds.bottom(), self.anchor, self.zoom)
 
         changed = False
-        radius_sq = self.brush_radius ** 2
-        for r in range(center_row - self.brush_radius, center_row + self.brush_radius + 1):
-            for c in range(center_col - self.brush_radius, center_col + self.brush_radius + 1):
-                if (r - center_row) ** 2 + (c - center_col) ** 2 > radius_sq:
+        for row in range(min_row - 1, max_row + 2):
+            for col in range(min_col - 1, max_col + 2):
+                x, y, w, h = geom.section_to_pixel_rect(row, col, self.anchor, self.zoom)
+                if not outline.intersects(QRectF(x, y, w, h)):
                     continue
-                key = (r, c)
+                key = (row, col)
                 if self._erase_mode:
                     if key in self.painted:
                         self.painted.discard(key)
@@ -175,10 +277,27 @@ class SectionCanvas(QGraphicsView):
         self.mask_image.fill(Qt.GlobalColor.transparent)
         painter = QPainter(self.mask_image)
         for (row, col) in self.painted:
-            x, y, w, h = geom.section_to_pixel_rect(row, col, self.anchor, self.zoom)
             region_id = self.region_of.get((row, col))
-            color = _REGION_PALETTE[region_id % len(_REGION_PALETTE)] if region_id is not None else _PAINTED_COLOR
-            painter.fillRect(QRectF(x, y, w, h), color)
+            if region_id is None:
+                # Not yet clustered into a region - just show what's been painted.
+                x, y, w, h = geom.section_to_pixel_rect(row, col, self.anchor, self.zoom)
+                painter.fillRect(QRectF(x, y, w, h), _PAINTED_COLOR)
+                continue
+
+            # Clustered into a region - leave the interior transparent and only
+            # stroke the edges that border a different region (or empty space),
+            # so the outline traces the region's outer shape rather than every cell.
+            pen = QPen(region_color(region_id), _REGION_OUTLINE_WIDTH)
+            painter.setPen(pen)
+            x, y, w, h = geom.section_to_pixel_rect(row, col, self.anchor, self.zoom)
+            for (dr, dc, x1, y1, x2, y2) in (
+                (-1, 0, x, y, x + w, y),          # top
+                (1, 0, x, y + h, x + w, y + h),   # bottom
+                (0, -1, x, y, x, y + h),          # left
+                (0, 1, x + w, y, x + w, y + h),   # right
+            ):
+                if self.region_of.get((row + dr, col + dc)) != region_id:
+                    painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
         painter.end()
         self.mask_item.setPixmap(QPixmap.fromImage(self.mask_image))
 

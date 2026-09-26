@@ -1,0 +1,5 @@
+{
+    "coarse": {"num_layers": 31, "z_step": 0.005},
+    "medium": {"num_layers": 15, "z_step": 0.005},
+    "fine": {"num_layers": 29, "z_step": 0.001}
+}

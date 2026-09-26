@@ -16,8 +16,6 @@ from region_plane_fit import RegionPlaneFit
 _DEFAULT_TARGET_REGION_SIZE = 75
 _DEFAULT_FOCUS_POINTS_PER_REGION = 4
 _DEFAULT_AF_Z_START = -0.010
-_DEFAULT_AF_Z_STEP = 0.001
-_DEFAULT_AF_NUM_LAYERS = 21
 
 # DOVER_UI is a sibling checkout that already carries the operator's calibration
 # (Stage Calibration tab, saved to its saved-calibration/ folder). Auto-loading its
@@ -120,27 +118,13 @@ class RegionDesignerWindow(QMainWindow):
         self.region_id_spin.setRange(0, 9999)
         toolbar.addWidget(self.region_id_spin)
 
-        toolbar.addWidget(QLabel(" AF Z start: "))
+        toolbar.addWidget(QLabel(" AF Z start (initial guess): "))
         self.af_z_start_spin = QDoubleSpinBox()
         self.af_z_start_spin.setDecimals(4)
         self.af_z_start_spin.setRange(-10.0, 10.0)
         self.af_z_start_spin.setSingleStep(0.001)
         self.af_z_start_spin.setValue(_DEFAULT_AF_Z_START)
         toolbar.addWidget(self.af_z_start_spin)
-
-        toolbar.addWidget(QLabel(" AF Z step: "))
-        self.af_z_step_spin = QDoubleSpinBox()
-        self.af_z_step_spin.setDecimals(4)
-        self.af_z_step_spin.setRange(0.0001, 1.0)
-        self.af_z_step_spin.setSingleStep(0.0005)
-        self.af_z_step_spin.setValue(_DEFAULT_AF_Z_STEP)
-        toolbar.addWidget(self.af_z_step_spin)
-
-        toolbar.addWidget(QLabel(" AF layers: "))
-        self.af_num_layers_spin = QSpinBox()
-        self.af_num_layers_spin.setRange(3, 101)
-        self.af_num_layers_spin.setValue(_DEFAULT_AF_NUM_LAYERS)
-        toolbar.addWidget(self.af_num_layers_spin)
 
         self.run_autofocus_btn = QPushButton("Run Autofocus for Region")
         self.run_autofocus_btn.clicked.connect(self._on_run_autofocus_clicked)
@@ -213,8 +197,6 @@ class RegionDesignerWindow(QMainWindow):
         worker = AutofocusSequenceWorker(
             self.bridge, self.calibration, points,
             z_start=self.af_z_start_spin.value(),
-            z_step=self.af_z_step_spin.value(),
-            num_layers=self.af_num_layers_spin.value(),
         )
         worker.pointStarted.connect(self._on_autofocus_point_started)
         worker.pointFailed.connect(self._on_autofocus_point_failed)
