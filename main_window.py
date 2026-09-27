@@ -7,7 +7,9 @@ from PySide6.QtWidgets import (
 
 from canvas_view import SectionCanvas
 from controller_bridge import ControllerBridge
+import confirmation_scan
 import region_clustering as clustering
+import scan_archive
 from stage_calibration import StageCalibration
 from autofocus_client import AutofocusSequenceWorker
 from focus_review_dialog import FocusReviewDialog
@@ -48,7 +50,7 @@ class RegionDesignerWindow(QMainWindow):
         self.bridge.imageReady.connect(self._on_image_ready)
         self.bridge.commandError.connect(self._on_command_error)
         self.bridge.sectionScanning.connect(self._on_section_scanning)
-        self.bridge.sectionReconstructing.connect(self._on_section_reconstructing)
+        self.bridge.reconstructionFinished.connect(self._on_reconstruction_finished)
 
         self.calibration: StageCalibration | None = None
         self.region_focus_points: dict[int, list[tuple[float, float, float]]] = {}  # region_id -> [(row,col,z)]
@@ -59,6 +61,21 @@ class RegionDesignerWindow(QMainWindow):
         self._review_dialog: FocusReviewDialog | None = None
         self._scan_worker = None
         self._scanning_region_id: int | None = None
+        self._scan_existing_run_folders: set[str] = set()
+        # Sections that finished physical scanning but have no confirmed
+        # reconstruction-complete event yet, oldest first - see
+        # _on_reconstruction_finished (the controller's reconstruction-off
+        # broadcast carries no row/col, so this FIFO is how each broadcast gets
+        # attributed back to a specific section for the canvas overlay).
+        self._pending_reconstruction: list[tuple[int, int]] = []
+        self._aggregate_root: str | None = None
+
+        # "Auto Run All Regions": autofocus -> confirm -> fit plane -> scan,
+        # then advance to the next region, repeated unattended for every region
+        # in region_ids order - see _run_auto_pipeline_region/_advance_auto_pipeline.
+        self._auto_pipeline_active = False
+        self._auto_pipeline_region_ids: list[int] = []
+        self._auto_pipeline_index: int = 0
 
         self._build_toolbar()
         self.status_label = QLabel("No calibration loaded.")
@@ -190,6 +207,34 @@ class RegionDesignerWindow(QMainWindow):
         self.scan_region_btn.clicked.connect(self._on_scan_region_clicked)
         toolbar.addWidget(self.scan_region_btn)
 
+        toolbar.addSeparator()
+
+        self.auto_run_all_regions_btn = QPushButton("Auto Run All Regions")
+        self.auto_run_all_regions_btn.setToolTip(
+            "Fully automated: for every region (in order), runs autofocus, auto-confirms every point "
+            "via Auto Search, fits the region plane, then submits a real region scan - then moves on "
+            "to the next region and repeats until all regions are done. No per-region confirmation "
+            "prompts once started. Use 'Stop After Current Region' to halt between regions."
+        )
+        self.auto_run_all_regions_btn.clicked.connect(self._on_auto_run_all_regions_clicked)
+        toolbar.addWidget(self.auto_run_all_regions_btn)
+
+        self.stop_auto_pipeline_btn = QPushButton("Stop After Current Region")
+        self.stop_auto_pipeline_btn.setEnabled(False)
+        self.stop_auto_pipeline_btn.clicked.connect(self._on_stop_auto_pipeline_clicked)
+        toolbar.addWidget(self.stop_auto_pipeline_btn)
+
+        toolbar.addSeparator()
+
+        self.start_aggregate_btn = QPushButton("Start New Aggregate Batch")
+        self.start_aggregate_btn.setToolTip(
+            "Creates a new timestamped folder under IMAGES_ROOT and, from then on, files each "
+            "region's confirmed autofocus captures and full-region scan output into it as "
+            "Region_N/Focus_M and Region_N/Scan_data. Nothing is archived until this is clicked."
+        )
+        self.start_aggregate_btn.clicked.connect(self._on_start_aggregate_clicked)
+        toolbar.addWidget(self.start_aggregate_btn)
+
     def _on_brush_radius_changed(self, value: int):
         self.canvas.brush_radius = value
 
@@ -206,10 +251,25 @@ class RegionDesignerWindow(QMainWindow):
         QMessageBox.warning(self, "Controller error", message)
 
     def _on_section_scanning(self, master_row: int, master_col: int, active: bool):
-        self._set_section_activity(master_row, master_col, "scanning" if active else None)
+        if active:
+            self._set_section_activity(master_row, master_col, "scanning")
+        else:
+            # Scanning's done for this section, but the controller's own
+            # reconstruction-off broadcast (_on_reconstruction_finished) has no
+            # row/col - it's a per-batch, not per-section, event. Sections are
+            # reconstructed in the order they finish scanning, so track them
+            # FIFO and resolve the oldest pending one each time reconstruction-
+            # off fires - a persistent "reconstructed" marker (a different,
+            # darker color - see canvas_view._SECTION_ACTIVITY_COLORS) rather
+            # than clearing back to no overlay, so completed sections stay
+            # visibly distinguishable as reconstruction works through the rest.
+            self._set_section_activity(master_row, master_col, "reconstructing")
+            self._pending_reconstruction.append((master_row, master_col))
 
-    def _on_section_reconstructing(self, master_row: int, master_col: int, active: bool):
-        self._set_section_activity(master_row, master_col, "reconstructing" if active else None)
+    def _on_reconstruction_finished(self):
+        if self._pending_reconstruction:
+            master_row, master_col = self._pending_reconstruction.pop(0)
+            self._set_section_activity(master_row, master_col, "reconstructed")
 
     def _set_section_activity(self, master_row: int, master_col: int, activity: str | None):
         """master_row/master_col are master-grid (absolute) coordinates, as the
@@ -260,6 +320,10 @@ class RegionDesignerWindow(QMainWindow):
         self.canvas.clear_regions()
         self.region_id_spin.setMaximum(9999)
 
+    def _on_start_aggregate_clicked(self):
+        self._aggregate_root = scan_archive.start_new_aggregate_batch()
+        self.status_label.setText(f"New aggregate batch: {os.path.basename(self._aggregate_root)}")
+
     def _on_load_calibration_clicked(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select a calibration data file", "", "JSON Files (*.json)")
         if not path:
@@ -276,19 +340,23 @@ class RegionDesignerWindow(QMainWindow):
     def _on_auto_run_autofocus_clicked(self):
         self._start_autofocus_run(auto_confirm=True, auto_finish=self.auto_finish_checkbox.isChecked())
 
-    def _start_autofocus_run(self, auto_confirm: bool, auto_finish: bool):
+    def _start_autofocus_run(self, auto_confirm: bool, auto_finish: bool) -> bool:
+        """Returns True once the autofocus worker has actually been started,
+        False if it couldn't be (missing calibration/points, or hardware busy)
+        - used by the fully-automated pipeline to detect a region it can't
+        proceed with and stop cleanly rather than hang."""
         if self.calibration is None:
             QMessageBox.warning(self, "Run Autofocus", "Load a calibration file first.")
-            return
+            return False
         if self.bridge.is_busy():
             QMessageBox.warning(self, "Run Autofocus", "Another hardware operation is already in progress.")
-            return
+            return False
 
         region_id = self.region_id_spin.value()
         points = self.canvas.focus_points_by_region().get(region_id)
         if not points:
             QMessageBox.information(self, "Run Autofocus", f"No focus points found for region {region_id}.")
-            return
+            return False
 
         # focus_points_by_region() iterates canvas.focus_point_items in the same
         # order it builds `points` in, so this list lines up index-for-index with
@@ -323,6 +391,7 @@ class RegionDesignerWindow(QMainWindow):
         self._af_region_items = region_items
         self._af_worker = worker  # keep alive for the duration of the sequence
         worker.start()
+        return True
 
     def _on_autofocus_point_started(self, index: int, total: int):
         self.status_label.setText(f"Running autofocus: point {index + 1}/{total}")
@@ -350,6 +419,7 @@ class RegionDesignerWindow(QMainWindow):
         self.run_autofocus_btn.setEnabled(enabled)
         self.auto_run_autofocus_btn.setEnabled(enabled)
         self.scan_region_btn.setEnabled(enabled)
+        self.auto_run_all_regions_btn.setEnabled(enabled)
 
     def _on_autofocus_sequence_finished(self, region_id: int, worker: AutofocusSequenceWorker):
         self._set_hardware_controls_enabled(True)
@@ -370,6 +440,10 @@ class RegionDesignerWindow(QMainWindow):
                 f"Region {region_id}: {len(self.region_focus_points[region_id])} focus point(s) confirmed."
             )
             self.canvas.set_region_status(region_id, "confirmed")
+            if self._aggregate_root is not None:
+                for focus_index, captures in dialog.captures_by_index().items():
+                    if captures:
+                        scan_archive.archive_focus_point(self._aggregate_root, region_id, focus_index, captures)
         else:
             # Operator declined the fit (or closed the dialog) - go back to
             # unmarked/pending so a retry is unambiguous.
@@ -378,26 +452,33 @@ class RegionDesignerWindow(QMainWindow):
         if self._review_dialog is dialog:
             self._review_dialog = None
 
+        if self._auto_pipeline_active:
+            self._continue_auto_pipeline(region_id, confirmed=result == FocusReviewDialog.DialogCode.Accepted)
+
     def _on_fit_plane_clicked(self):
-        region_id = self.region_id_spin.value()
+        self._fit_plane_for_region(self.region_id_spin.value())
+
+    def _fit_plane_for_region(self, region_id: int) -> bool:
+        """Returns True on success. Shared by the manual 'Fit Region Plane'
+        button and the fully-automated pipeline."""
         focus_points = self.region_focus_points.get(region_id)
         if not focus_points:
             QMessageBox.information(
                 self, "Fit Region Plane",
                 f"Run autofocus and confirm region {region_id}'s focus points first.",
             )
-            return
+            return False
 
         region_sections = [s for s, rid in self.canvas.region_of.items() if rid == region_id]
         if not region_sections:
             QMessageBox.information(self, "Fit Region Plane", f"No painted sections found for region {region_id}.")
-            return
+            return False
 
         try:
             plane = RegionPlaneFit(focus_points)
         except ValueError as e:
             QMessageBox.warning(self, "Fit Region Plane", str(e))
-            return
+            return False
 
         self.section_z.update(plane.fill_sections(region_sections))
         residuals = plane.residuals()
@@ -405,6 +486,7 @@ class RegionDesignerWindow(QMainWindow):
             f"Region {region_id}: plane fit over {len(region_sections)} section(s), "
             f"max focus-point residual = {max(residuals):.4f}mm."
         )
+        return True
 
     def _on_scan_region_clicked(self):
         if self.calibration is None:
@@ -413,12 +495,16 @@ class RegionDesignerWindow(QMainWindow):
         if self.bridge.is_busy():
             QMessageBox.warning(self, "Scan Region", "Another hardware operation is already in progress.")
             return
+        self._start_region_scan(self.region_id_spin.value(), confirm=True)
 
-        region_id = self.region_id_spin.value()
+    def _start_region_scan(self, region_id: int, confirm: bool) -> bool:
+        """Returns True once the scan worker has actually been started.
+        confirm=False (used by the fully-automated pipeline) skips the "are you
+        sure, real hardware will move" prompt, since nobody's there to click it."""
         region_sections = [s for s, rid in self.canvas.region_of.items() if rid == region_id]
         if not region_sections:
             QMessageBox.information(self, "Scan Region", f"No painted sections found for region {region_id}.")
-            return
+            return False
 
         missing_z = [s for s in region_sections if s not in self.section_z]
         if missing_z:
@@ -427,39 +513,53 @@ class RegionDesignerWindow(QMainWindow):
                 f"{len(missing_z)} of region {region_id}'s section(s) have no Z yet - "
                 f"run Fit Region Plane for this region first.",
             )
-            return
+            return False
 
         ordered_sections = clustering.serpentine_order(region_sections)
         sections_with_z = [(row, col, self.section_z[(row, col)]) for row, col in ordered_sections]
 
-        reply = QMessageBox.question(
-            self, "Scan Region",
-            f"Scan region {region_id} now? This submits a real {len(sections_with_z)}-section scan to the "
-            f"controller - the stage will move for real.\n\n"
-            f"Note: this scan is open-loop (drives straight to the Fit Region Plane Z, no live refocus), "
-            f"unlike DOVER_UI's own Image-Path Scan button which live-autofocuses during the scan - so "
-            f"results can look softer if the plane fit didn't perfectly capture the tissue's tilt/drift.",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+        if confirm:
+            reply = QMessageBox.question(
+                self, "Scan Region",
+                f"Scan region {region_id} now? This submits a real {len(sections_with_z)}-section scan to the "
+                f"controller - the stage will move for real.\n\n"
+                f"Note: this scan is open-loop (drives straight to the Fit Region Plane Z, no live refocus), "
+                f"unlike DOVER_UI's own Image-Path Scan button which live-autofocuses during the scan - so "
+                f"results can look softer if the plane fit didn't perfectly capture the tissue's tilt/drift.",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
 
         self._set_hardware_controls_enabled(False)
         self.status_label.setText(f"Scanning region {region_id}: {len(sections_with_z)} section(s)...")
         self.canvas.set_region_status(region_id, "scanning")
         self._scanning_region_id = region_id
+        # Snapshotted regardless of whether an aggregate batch is active (cheap -
+        # just an os.listdir), so _on_region_scan_finished can diff it either way.
+        self._scan_existing_run_folders = confirmation_scan.list_run_folders()
 
         worker = RegionScanWorker(self.bridge, self.calibration, sections_with_z)
         worker.scanFailed.connect(self._on_region_scan_failed)
         worker.scanFinished.connect(self._on_region_scan_finished)
         self._scan_worker = worker  # keep alive for the duration of the scan
         worker.start()
+        return True
 
     def _on_region_scan_finished(self):
         region_id = self._scanning_region_id
         self._set_hardware_controls_enabled(True)
         self.status_label.setText(f"Region {region_id}: scan complete.")
         self.canvas.set_region_status(region_id, "scanned")
+        if self._aggregate_root is not None:
+            new_folder_names = confirmation_scan.list_run_folders() - self._scan_existing_run_folders
+            new_run_folders = {
+                os.path.join(confirmation_scan.IMAGES_ROOT, name) for name in new_folder_names
+            }
+            if new_run_folders:
+                scan_archive.archive_region_scan(self._aggregate_root, region_id, new_run_folders)
         self._scanning_region_id = None
+        if self._auto_pipeline_active:
+            self._advance_auto_pipeline()
 
     def _on_region_scan_failed(self, message: str):
         region_id = self._scanning_region_id
@@ -467,7 +567,93 @@ class RegionDesignerWindow(QMainWindow):
         self.status_label.setText(f"Region {region_id}: scan failed.")
         self.canvas.set_region_status(region_id, "failed")
         self._scanning_region_id = None
-        QMessageBox.warning(self, "Scan Region", f"Scan failed: {message}")
+        if self._auto_pipeline_active:
+            self._end_auto_pipeline(
+                f"Auto Run All Regions: stopped - region {region_id} scan failed.",
+                f"Region {region_id} scan failed - stopping the automated run: {message}",
+            )
+        else:
+            QMessageBox.warning(self, "Scan Region", f"Scan failed: {message}")
+
+    def _on_auto_run_all_regions_clicked(self):
+        if self.calibration is None:
+            QMessageBox.warning(self, "Auto Run All Regions", "Load a calibration file first.")
+            return
+        if self.bridge.is_busy() or self._auto_pipeline_active:
+            QMessageBox.warning(self, "Auto Run All Regions", "Another hardware operation is already in progress.")
+            return
+
+        region_ids = sorted(set(self.canvas.region_of.values()))
+        if not region_ids:
+            QMessageBox.information(self, "Auto Run All Regions", "Compile regions first.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Auto Run All Regions",
+            f"Run autofocus, confirm, fit plane, and scan for all {len(region_ids)} region(s) automatically, "
+            f"one after another, with no further per-region confirmation? Real hardware scans will run "
+            f"unattended - use 'Stop After Current Region' to halt between regions.",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._auto_pipeline_active = True
+        self._auto_pipeline_region_ids = region_ids
+        self._auto_pipeline_index = 0
+        self.stop_auto_pipeline_btn.setEnabled(True)
+        self._run_auto_pipeline_region()
+
+    def _on_stop_auto_pipeline_clicked(self):
+        self._auto_pipeline_active = False
+        self.stop_auto_pipeline_btn.setEnabled(False)
+        self.status_label.setText("Auto Run All Regions: stopping after the current region finishes.")
+
+    def _run_auto_pipeline_region(self):
+        region_id = self._auto_pipeline_region_ids[self._auto_pipeline_index]
+        self.region_id_spin.setValue(region_id)
+        self.status_label.setText(
+            f"Auto Run All Regions ({self._auto_pipeline_index + 1}/{len(self._auto_pipeline_region_ids)}): "
+            f"region {region_id} - running autofocus..."
+        )
+        if not self._start_autofocus_run(auto_confirm=True, auto_finish=True):
+            self._end_auto_pipeline(f"Auto Run All Regions: stopped - region {region_id} autofocus could not start.")
+
+    def _continue_auto_pipeline(self, region_id: int, confirmed: bool):
+        """Called from _on_review_dialog_finished once a region's points are
+        either confirmed (auto_finish=True accepted the dialog) or not - picks
+        up the pipeline with fit-plane + scan, or stops it."""
+        if not self._auto_pipeline_active:
+            return  # stopped by the user while this region's autofocus/review was running
+        if not confirmed:
+            self._end_auto_pipeline(
+                f"Auto Run All Regions: stopped - region {region_id} was not confirmed.",
+                f"Region {region_id}'s focus points were not confirmed (autofocus failed, or every "
+                f"capture in the review failed) - stopping the automated run.",
+            )
+            return
+        if not self._fit_plane_for_region(region_id):
+            self._end_auto_pipeline(f"Auto Run All Regions: stopped - region {region_id} plane fit failed.")
+            return
+        if not self._start_region_scan(region_id, confirm=False):
+            self._end_auto_pipeline(f"Auto Run All Regions: stopped - region {region_id} scan could not start.")
+
+    def _advance_auto_pipeline(self):
+        if not self._auto_pipeline_active:
+            return  # stopped by the user while this region's scan was running
+        self._auto_pipeline_index += 1
+        if self._auto_pipeline_index >= len(self._auto_pipeline_region_ids):
+            self._end_auto_pipeline(
+                f"Auto Run All Regions: all {len(self._auto_pipeline_region_ids)} region(s) finished."
+            )
+            return
+        self._run_auto_pipeline_region()
+
+    def _end_auto_pipeline(self, status_message: str, warning_message: str | None = None):
+        self._auto_pipeline_active = False
+        self.stop_auto_pipeline_btn.setEnabled(False)
+        self.status_label.setText(status_message)
+        if warning_message:
+            QMessageBox.warning(self, "Auto Run All Regions", warning_message)
 
     def closeEvent(self, event):
         self.bridge.shutdown()

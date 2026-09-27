@@ -31,8 +31,9 @@ class FocusReviewDialog(QDialog):
         self.fits = fits
         self.confirmed_z: dict[int, float] = {}
         self._scan_worker = None
-        self._scan_captures: list[confirmation_scan.ScanCapture] = []  # current point's captures, sorted by z
-        self._captures_by_index: dict[int, list[confirmation_scan.ScanCapture]] = {}  # survives switching points
+        self._scan_captures: list[confirmation_scan.ScanCapture] = []  # currently DISPLAYED point's captures, sorted by z
+        self._captures_by_index: dict[int, list[confirmation_scan.ScanCapture]] = {}  # every point's captures, survives switching points
+        self._scan_index: int | None = None  # which point the running/last scan or auto-search chain actually belongs to - NOT necessarily the currently displayed one, so browsing other points mid-scan can't mix their images together
         self._scan_busy = False  # a confirm/extend scan worker is running right now
         self._auto_search_active = False  # an auto-search chain is in progress (see _continue_auto_search)
         self._auto_search_extra_used = 0
@@ -157,9 +158,16 @@ class FocusReviewDialog(QDialog):
         # in case the selected point's z_opt just changed.
         self._on_point_selected(self.list_widget.currentRow())
 
-        if self._auto_confirm_region and self.fits:
-            self._auto_confirm_skip = set()
-            self._advance_auto_confirm_region()
+        if self._auto_confirm_region:
+            if self.fits:
+                self._auto_confirm_skip = set()
+                self._advance_auto_confirm_region()
+            elif self._auto_finish_region:
+                # Nothing to review and nobody's there to close this dialog by
+                # hand - reject so main_window's finished-signal handler (and any
+                # fully-automated multi-region pipeline chained off it) doesn't
+                # hang forever waiting for a signal that would otherwise never come.
+                self.reject()
 
     def _label_for(self, index: int) -> str:
         fit = self.fits[index]
@@ -214,14 +222,17 @@ class FocusReviewDialog(QDialog):
 
     def _load_scan_session(self, row: int):
         """Switching points - restores this point's previously-captured comparison
-        images (if any), instead of dropping them, and cancels any auto-search
-        chain in progress for the point being left."""
-        self._auto_search_active = False
-        self.auto_search_btn.setText(_AUTO_SEARCH_LABEL)
+        images (if any), instead of dropping them. A scan/auto-search chain still
+        running for a DIFFERENT point (self._scan_index) is untouched by this -
+        it keeps running in the background and its results still land on the
+        right point (see _on_capture_ready) - so browsing other points mid-scan
+        is safe and doesn't interrupt it."""
         self._scan_captures = list(self._captures_by_index.get(row, []))
         self._clear_capture_row()
         for c in self._scan_captures:
             self.capture_row.addWidget(self._build_capture_panel(row, c))
+        is_active_here = self._auto_search_active and row == self._scan_index
+        self.auto_search_btn.setText("Auto searching..." if is_active_here else _AUTO_SEARCH_LABEL)
         self._refresh_scan_controls()
 
     def _clear_scan_session(self, index: int):
@@ -306,24 +317,29 @@ class FocusReviewDialog(QDialog):
 
     def _continue_auto_search(self) -> bool:
         """Returns True if another extension scan was started, False if the
-        search stopped (peak bracketed, budget spent, or nothing to go on)."""
-        if self._auto_search_extra_used >= _AUTO_SEARCH_MAX_EXTRA or not self._scan_captures:
+        search stopped (peak bracketed, budget spent, or nothing to go on).
+        Operates on self._scan_index (the point the chain actually belongs to),
+        not whatever point happens to be displayed - the operator may have
+        clicked elsewhere in the list while this was running."""
+        index = self._scan_index
+        if index is None:
             return False
-        index = self.list_widget.currentRow()
-        if index < 0:
+        captures = self._captures_by_index.get(index, [])
+        if self._auto_search_extra_used >= _AUTO_SEARCH_MAX_EXTRA or not captures:
             return False
 
-        best_i = max(range(len(self._scan_captures)), key=lambda i: self._scan_captures[i].contrast_score)
-        if 0 < best_i < len(self._scan_captures) - 1:
+        best_i = max(range(len(captures)), key=lambda i: captures[i].contrast_score)
+        if 0 < best_i < len(captures) - 1:
             return False  # highest contrast already has a lower neighbor on each side - peak's in view
 
-        direction = 1 if best_i == len(self._scan_captures) - 1 else -1
-        next_z = self._scan_captures[best_i].z + direction * confirmation_scan.MICRON_MM
+        direction = 1 if best_i == len(captures) - 1 else -1
+        next_z = captures[best_i].z + direction * confirmation_scan.MICRON_MM
         self._auto_search_extra_used += 1
         self._start_scan(index, self.fits[index], [next_z])
         return True
 
     def _start_scan(self, index: int, fit, z_values: list[float]):
+        self._scan_index = index
         self._scan_busy = True
         self._refresh_scan_controls()
 
@@ -357,11 +373,14 @@ class FocusReviewDialog(QDialog):
         """Called once a point's Auto Search chain (started by
         _advance_auto_confirm_region) has stopped - picks that point's
         highest-contrast capture as its confirmed Z, same as clicking 'Pick this
-        Z' on it, then moves auto-confirm on to the next point."""
-        index = self.list_widget.currentRow()
-        if index >= 0:
-            if self._scan_captures:
-                best = max(self._scan_captures, key=lambda c: c.contrast_score)
+        Z' on it, then moves auto-confirm on to the next point. Uses
+        self._scan_index rather than the currently displayed row, since the
+        operator may have clicked to a different point while this was running."""
+        index = self._scan_index
+        if index is not None:
+            captures = self._captures_by_index.get(index, [])
+            if captures:
+                best = max(captures, key=lambda c: c.contrast_score)
                 self._on_pick_z(index, best.z)
             else:
                 # every capture for this point failed - nothing to pick from;
@@ -394,12 +413,19 @@ class FocusReviewDialog(QDialog):
         self._on_auto_search()
 
     def _on_capture_ready(self, index: int, capture):
-        self._scan_captures.append(capture)
-        self._scan_captures.sort(key=lambda c: c.z)
-        self._captures_by_index[index] = list(self._scan_captures)
+        """A capture always belongs to the point the scan was actually started
+        for (index, bound at _start_scan time) - never to whatever point the
+        operator happens to be looking at right now, which may have changed
+        while this scan was running on real hardware."""
+        captures = self._captures_by_index.setdefault(index, [])
+        captures.append(capture)
+        captures.sort(key=lambda c: c.z)
 
+        if index != self.list_widget.currentRow():
+            return  # not the point currently on screen - leave the visible gallery alone
+        self._scan_captures = captures
         self._clear_capture_row()
-        for c in self._scan_captures:
+        for c in captures:
             self.capture_row.addWidget(self._build_capture_panel(index, c))
         self._refresh_scan_controls()
 
@@ -423,7 +449,7 @@ class FocusReviewDialog(QDialog):
             # A modal box here would silently block the whole unattended region
             # run waiting for a click nobody's there to give - _continue_auto_search
             # and _auto_pick_best_and_continue already cope with a capture missing
-            # from _scan_captures, so just note it and let the chain carry on.
+            # from _captures_by_index, so just note it and let the chain carry on.
             self.z_label.setText(f"Auto Search: capture at Z={z:.4f} failed ({message}) - continuing")
             return
         QMessageBox.warning(self, "Confirmation scan failed", f"Z={z:.4f}: {message}")
@@ -431,7 +457,8 @@ class FocusReviewDialog(QDialog):
     def _on_pick_z(self, index: int, z: float):
         self.confirmed_z[index] = z
         self._refresh_list_labels()
-        self._on_point_selected(index)
+        if index == self.list_widget.currentRow():
+            self._on_point_selected(index)
 
     def _on_manual_apply(self):
         index = self.list_widget.currentRow()
@@ -458,3 +485,9 @@ class FocusReviewDialog(QDialog):
     def result_focus_points(self) -> list[tuple[float, float, float]]:
         """[(row, col, z), ...] for every point - only meaningful after accept()."""
         return [(self.fits[i].row, self.fits[i].col, self.confirmed_z[i]) for i in range(len(self.fits))]
+
+    def captures_by_index(self) -> dict[int, list[confirmation_scan.ScanCapture]]:
+        """Every point's confirmation-scan captures, keyed by point index - used
+        by main_window to archive each focus point's run folders once the
+        region is confirmed (see scan_archive.archive_focus_point)."""
+        return self._captures_by_index

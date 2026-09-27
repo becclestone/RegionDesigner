@@ -366,12 +366,13 @@ cTEMP_SENSOR_5 = "!ts5"
 cTEMP_SENSOR_6 = "!ts6"
 cTEMP_SENSOR_7 = "!ts7"
 #
-# recon messages to UI
-cRECON_ON_MSG = "!ron"
-cRECON_OFF_MSG = "!roff"
-# payload is reusing constants
-# cSECTION_ROW = "$sr"
-# cSECTION_COL = "$sc"
+# recon messages to UI - broadcast once per reconstruction batch (not per
+# section - no row/col identifies which section(s) it covers), no payload.
+# Verified against dover_ctl2/include/Config/implementation_constants.h, whose
+# values ("-rON"/"-rOFF") this previously didn't match at all (this repo's old
+# "!ron"/"!roff" never matched anything the controller actually sends).
+cRECON_ON_MSG = "-rON"
+cRECON_OFF_MSG = "-rOFF"
 #
 # replay payload fields
 # error fields below are common and defined in shared_rmq_constants

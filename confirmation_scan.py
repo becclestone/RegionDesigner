@@ -27,8 +27,13 @@ MICRON_MM = 0.001  # public: focus_review_dialog uses this to step the "add a po
 # The reconstruction/save pipeline writes the NR tif some time after the scan
 # itself reports cPATH_UPDATE_MSG complete - observed delay is up to ~20s, so the
 # run folder can exist (and its NR subfolder be empty) for a while before the file
-# actually lands. Poll for the file itself rather than failing the moment the
-# folder appears.
+# actually lands. _wait_for_image below is driven primarily by the controller's
+# own reconstruction-off broadcast (ControllerBridge.wait_for_reconstruction_off),
+# which is far faster than polling - but that message is a per-batch, not
+# per-section, broadcast (see its docstring), so its correlation to any one
+# capture isn't formally guaranteed; keep polling for the file itself on every
+# interval too; whichever notices the file first wins, so a missed/misattributed
+# message can never cause an indefinite hang.
 _IMAGE_APPEAR_TIMEOUT_S = 60.0
 _IMAGE_APPEAR_POLL_INTERVAL_S = 1.0
 
@@ -44,7 +49,9 @@ class ScanCapture:
     contrast_score: float
 
 
-def _list_run_folders() -> set:
+def list_run_folders() -> set:
+    """Public: also used by scan_archive.py to snapshot/diff IMAGES_ROOT around
+    a region scan, for archiving its output run folders."""
     if not os.path.isdir(IMAGES_ROOT):
         return set()
     return {name for name in os.listdir(IMAGES_ROOT) if os.path.isdir(os.path.join(IMAGES_ROOT, name))}
@@ -55,29 +62,31 @@ def _wait_for_new_run_folder(existing: set, timeout: float = 60.0, poll_interval
     example), so the run just triggered is whichever folder wasn't there before."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        new_folders = _list_run_folders() - existing
+        new_folders = list_run_folders() - existing
         if new_folders:
             return os.path.join(IMAGES_ROOT, max(new_folders))
         time.sleep(poll_interval)
     raise TimeoutError("Scan completed but no new output folder appeared under IMAGES_ROOT.")
 
 
-def _wait_for_file(path: str, timeout: float = _IMAGE_APPEAR_TIMEOUT_S,
-                    poll_interval: float = _IMAGE_APPEAR_POLL_INTERVAL_S) -> None:
+def _wait_for_image(bridge, path: str, timeout: float = _IMAGE_APPEAR_TIMEOUT_S,
+                     poll_interval: float = _IMAGE_APPEAR_POLL_INTERVAL_S) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        remaining = deadline - time.time()
+        if bridge.wait_for_reconstruction_off(min(poll_interval, max(remaining, 0.0))) and os.path.isfile(path):
+            return
         if os.path.isfile(path):
             return
-        time.sleep(poll_interval)
     raise TimeoutError(
         f"Timed out after {timeout:.0f}s waiting for {path} to appear "
         f"(scan completed but the reconstruction/save pipeline may still be running)."
     )
 
 
-def score_nr_image(run_folder: str, row: int, col: int) -> tuple:
+def score_nr_image(bridge, run_folder: str, row: int, col: int) -> tuple:
     image_path = os.path.join(run_folder, "NR", f"s-{row}-{col}_nr_float32.tif")
-    _wait_for_file(image_path)
+    _wait_for_image(bridge, image_path)
     time.sleep(_IMAGE_SETTLE_DELAY_S)
     image = tifffile.imread(image_path)
     return image_path, float(np.percentile(image, 99))
@@ -119,10 +128,10 @@ class ConfirmationScanWorker(QObject):
 
         for z in self.z_values:
             try:
-                existing = _list_run_folders()
+                existing = list_run_folders()
                 self.bridge.run_single_section_scan(self.row, self.col, z)
                 run_folder = _wait_for_new_run_folder(existing)
-                image_path, score = score_nr_image(run_folder, self.row, self.col)
+                image_path, score = score_nr_image(self.bridge, run_folder, self.row, self.col)
                 self.captureReady.emit(ScanCapture(z=z, image_path=image_path, contrast_score=score))
             except Exception as e:
                 self.captureFailed.emit(z, str(e))
