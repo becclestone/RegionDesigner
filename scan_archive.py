@@ -73,3 +73,20 @@ def archive_region_scan(aggregate_root: str, region_id: int, run_folders: set) -
     confirmation_scan.list_run_folders() before/after the scan)."""
     dest_dir = os.path.join(aggregate_root, f"Region_{region_id}", "Scan_data")
     Thread(target=_move_run_folders, args=(run_folders, dest_dir), daemon=True).start()
+
+
+def archive_autofocus_log(aggregate_root: str, region_id: int, staging_path: str) -> None:
+    """Moves this region's staged autofocus_log.json (see autofocus_log.py,
+    written once the region's autofocus sequence finishes and updated with
+    confirmed Z values on accept) into Region_{region_id}/ under
+    aggregate_root - same confirm-time trigger as archive_focus_point, but a
+    single small file rather than whole image folders, so this runs inline
+    rather than on a background thread."""
+    if not os.path.isfile(staging_path):
+        return  # already archived, or the region's log was never written
+    dest_dir = os.path.join(aggregate_root, f"Region_{region_id}")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, os.path.basename(staging_path))
+    if os.path.exists(dest):
+        return  # already archived under this exact name - don't clobber
+    shutil.move(staging_path, dest)

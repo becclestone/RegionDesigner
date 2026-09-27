@@ -30,6 +30,7 @@ class FocusReviewDialog(QDialog):
         self.calibration = calibration
         self.fits = fits
         self.confirmed_z: dict[int, float] = {}
+        self.confirmed_source: dict[int, str] = {}  # index -> "scan"/"manual"/"default", parallel to confirmed_z
         self._scan_worker = None
         self._scan_captures: list[confirmation_scan.ScanCapture] = []  # currently DISPLAYED point's captures, sorted by z
         self._captures_by_index: dict[int, list[confirmation_scan.ScanCapture]] = {}  # every point's captures, survives switching points
@@ -456,6 +457,7 @@ class FocusReviewDialog(QDialog):
 
     def _on_pick_z(self, index: int, z: float):
         self.confirmed_z[index] = z
+        self.confirmed_source[index] = "scan"
         self._refresh_list_labels()
         if index == self.list_widget.currentRow():
             self._on_point_selected(index)
@@ -465,6 +467,7 @@ class FocusReviewDialog(QDialog):
         if index < 0:
             return
         self.confirmed_z[index] = self.manual_z_spin.value()
+        self.confirmed_source[index] = "manual"
         self._refresh_list_labels()
         self._on_point_selected(index)
 
@@ -480,11 +483,18 @@ class FocusReviewDialog(QDialog):
                 return
             for i in missing:
                 self.confirmed_z[i] = self.fits[i].z_opt
+                self.confirmed_source[i] = "default"
         self.accept()
 
     def result_focus_points(self) -> list[tuple[float, float, float]]:
         """[(row, col, z), ...] for every point - only meaningful after accept()."""
         return [(self.fits[i].row, self.fits[i].col, self.confirmed_z[i]) for i in range(len(self.fits))]
+
+    def confirmed_z_with_source(self) -> dict[int, tuple[float, str]]:
+        """focus_index -> (confirmed Z, how it was confirmed: 'scan'/'manual'/
+        'default') - only meaningful after accept(). Used by main_window to
+        fill in autofocus_log.json's confirmed_z/confirmed_source fields."""
+        return {i: (self.confirmed_z[i], self.confirmed_source[i]) for i in range(len(self.fits))}
 
     def captures_by_index(self) -> dict[int, list[confirmation_scan.ScanCapture]]:
         """Every point's confirmation-scan captures, keyed by point index - used

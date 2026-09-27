@@ -1,5 +1,6 @@
 import glob
 import os
+import time
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -9,6 +10,7 @@ from PySide6.QtWidgets import (
 from canvas_view import SectionCanvas
 from controller_bridge import ControllerBridge
 import confirmation_scan
+import autofocus_log
 import region_clustering as clustering
 import scan_archive
 from stage_calibration import StageCalibration
@@ -20,15 +22,16 @@ from region_scan import RegionScanWorker
 _DEFAULT_TARGET_REGION_SIZE = 100
 _DEFAULT_FOCUS_POINTS_PER_REGION = 4
 _DEFAULT_AF_Z_START = -0.010
-# Per-section budget for how long a region scan's archive-to-aggregate-batch
-# move waits for reconstruction-off before archiving anyway (see
-# _force_finish_scan_archive) - matches confirmation_scan.py's documented ~20s
-# observed reconstruction lag per section, scaled by the section count of the
-# scan in question (see _on_region_scan_finished) rather than one flat timeout,
-# since a large region's reconstruction backlog is proportionally longer than a
-# small one's.
-_RECON_TIMEOUT_PER_SECTION_S = 20.0
-_MIN_SCAN_ARCHIVE_TIMEOUT_MS = 60 * 1000  # floor for very small (e.g. 1-section) scans
+# A region scan's archive-to-aggregate-batch move waits for every section's
+# reconstruction-off message (see _on_section_reconstructing); _recheck_tracker_files
+# is the fallback for a message that never arrives, and re-checks the actual NR
+# file on disk rather than guessing a fixed wait time - real reconstruction lag
+# varies too much (single-section vs. large multi-section backlog, hardware
+# load, etc.) for any fixed number to be both safe and not-premature, so the
+# ground truth (the file's real presence) is what gates archiving, not a timer.
+_RECON_POLL_INTERVAL_MS = 15 * 1000
+# Purely informational - keeps waiting either way, never forces an archive.
+_RECON_STALL_WARNING_S = 10 * 60
 
 # DOVER_UI is a sibling checkout that already carries the operator's calibration
 # (Stage Calibration tab, saved to its saved-calibration/ folder). Auto-loading its
@@ -68,6 +71,7 @@ class RegionDesignerWindow(QMainWindow):
         self._af_worker = None
         self._af_region_id: int | None = None
         self._af_region_items: list = []
+        self._af_log_path: str | None = None  # this region's staged autofocus_log.json, see autofocus_log.py
         self._review_dialog: FocusReviewDialog | None = None
         self._scan_worker = None
         self._scanning_region_id: int | None = None
@@ -448,6 +452,16 @@ class RegionDesignerWindow(QMainWindow):
         if not worker.fits:
             self.canvas.set_region_status(region_id, "failed")
 
+        # Written now (coarse/medium/fine sweep data, no confirmed Z yet) so a
+        # region's raw autofocus data survives even if the operator never
+        # confirms it; _on_review_dialog_finished fills in confirmed_z/source
+        # into this same file once (if) they do. See autofocus_log.py.
+        try:
+            self._af_log_path = autofocus_log.write_region_log(region_id, worker.records)
+        except OSError as e:
+            self._af_log_path = None
+            self.status_label.setText(f"Autofocus done for region {region_id}, but could not write its log: {e}")
+
     def _on_review_dialog_finished(self, region_id: int, dialog: FocusReviewDialog, result: int):
         if not dialog.fits:
             pass  # already marked "failed" in _on_autofocus_sequence_finished; nothing to confirm
@@ -457,10 +471,14 @@ class RegionDesignerWindow(QMainWindow):
                 f"Region {region_id}: {len(self.region_focus_points[region_id])} focus point(s) confirmed."
             )
             self.canvas.set_region_status(region_id, "confirmed")
+            if self._af_log_path is not None:
+                autofocus_log.update_confirmed(self._af_log_path, dialog.confirmed_z_with_source())
             if self._aggregate_root is not None:
                 for focus_index, captures in dialog.captures_by_index().items():
                     if captures:
                         scan_archive.archive_focus_point(self._aggregate_root, region_id, focus_index, captures)
+                if self._af_log_path is not None:
+                    scan_archive.archive_autofocus_log(self._aggregate_root, region_id, self._af_log_path)
         else:
             # Operator declined the fit (or closed the dialog) - go back to
             # unmarked/pending so a retry is unambiguous.
@@ -564,10 +582,7 @@ class RegionDesignerWindow(QMainWindow):
             (int(round(self.calibration.offset_row + row)), int(round(self.calibration.offset_col + col)))
             for row, col, _z in sections_with_z
         }
-        tracker = {
-            "region_id": region_id, "remaining": set(master_sections), "folders": None, "ready": False,
-            "total_sections": len(master_sections),
-        }
+        tracker = {"region_id": region_id, "remaining": set(master_sections), "folders": None, "ready": False}
         self._scan_recon_trackers.append(tracker)
         self._active_scan_tracker = tracker
 
@@ -601,11 +616,12 @@ class RegionDesignerWindow(QMainWindow):
                     # out from under the writer still finishing it.
                     tracker["folders"] = new_run_folders
                     tracker["ready"] = True
-                    timeout_ms = max(
-                        int(_RECON_TIMEOUT_PER_SECTION_S * tracker["total_sections"] * 1000),
-                        _MIN_SCAN_ARCHIVE_TIMEOUT_MS,
-                    )
-                    QTimer.singleShot(timeout_ms, lambda t=tracker: self._force_finish_scan_archive(t))
+                    tracker["started"] = time.monotonic()
+                    tracker["warned"] = False
+                    timer = QTimer(self)
+                    timer.timeout.connect(lambda t=tracker: self._recheck_tracker_files(t))
+                    tracker["timer"] = timer
+                    timer.start(_RECON_POLL_INTERVAL_MS)
                     self._maybe_archive_tracker(tracker)
                 else:
                     self._scan_recon_trackers.remove(tracker)
@@ -618,24 +634,48 @@ class RegionDesignerWindow(QMainWindow):
     def _maybe_archive_tracker(self, tracker: dict):
         if not tracker["ready"] or tracker["remaining"]:
             return  # scan not finished yet, or some section(s) still reconstructing
+        timer = tracker.get("timer")
+        if timer is not None:
+            timer.stop()
         scan_archive.archive_region_scan(self._aggregate_root, tracker["region_id"], tracker["folders"])
         if tracker in self._scan_recon_trackers:
             self._scan_recon_trackers.remove(tracker)
 
-    def _force_finish_scan_archive(self, tracker: dict):
-        """Safety net: archives anyway after _SCAN_ARCHIVE_TIMEOUT_MS even if some
-        section(s) never reported reconstruction-off (a dropped message, say),
-        so an aggregate batch can't get stuck waiting forever - but only ever
-        fires after the normal wait already had a generous window to resolve."""
+    def _recheck_tracker_files(self, tracker: dict):
+        """Periodic fallback for a region scan's archive-wait: re-checks the
+        actual NR file for every section still in tracker["remaining"] directly
+        on disk, in case its reconstruction-off message (see
+        _on_section_reconstructing) was ever missed. The file's real presence is
+        ground truth, so this resolves a stuck tracker without ever guessing a
+        fixed wait time - and, critically, can never archive while a file it
+        expects is actually still missing, however long that takes."""
         if tracker not in self._scan_recon_trackers or not tracker["ready"]:
-            return  # already archived
-        if tracker["remaining"]:
+            timer = tracker.get("timer")
+            if timer is not None:
+                timer.stop()
+            return
+
+        found = set()
+        for master_row, master_col in tracker["remaining"]:
+            filename = f"s-{master_row}-{master_col}_nr_float32.tif"
+            if any(os.path.isfile(os.path.join(folder, "NR", filename)) for folder in tracker["folders"]):
+                found.add((master_row, master_col))
+        if found:
+            tracker["remaining"] -= found
+            for master_row, master_col in found:
+                self._set_section_activity(master_row, master_col, "reconstructed")
+
+        if not tracker["remaining"]:
+            self._maybe_archive_tracker(tracker)
+            return
+
+        elapsed = time.monotonic() - tracker["started"]
+        if elapsed > _RECON_STALL_WARNING_S and not tracker["warned"]:
+            tracker["warned"] = True
             self.status_label.setText(
-                f"Region {tracker['region_id']}: archiving scan data after timeout - "
-                f"{len(tracker['remaining'])} section(s) never reported reconstruction complete."
+                f"Region {tracker['region_id']}: still waiting on {len(tracker['remaining'])} section(s) to "
+                f"reconstruct after {elapsed / 60:.1f} min - scan data won't be archived until they're all done."
             )
-            tracker["remaining"].clear()
-        self._maybe_archive_tracker(tracker)
 
     def _on_region_scan_failed(self, message: str):
         region_id = self._scanning_region_id

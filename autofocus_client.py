@@ -80,6 +80,11 @@ class AutofocusSequenceWorker(QObject):
         self.points = points
         self.z_start = z_start
         self.fits: list[focus_fitting.FocusFit] = []
+        # One dict per point, in point order, for autofocus_log.py - coarse/medium
+        # sweep data plus (once finalize_region() has run) the fine stage's
+        # to_dict(). Populated even for a point whose sweeps raised partway
+        # through (status/error fields), unlike self.fits.
+        self.records: list[dict] = []
         self.stage_config = _load_stage_config()
 
     def start(self):
@@ -90,14 +95,25 @@ class AutofocusSequenceWorker(QObject):
         z_center = self.z_start
         for index, (row, col) in enumerate(self.points):
             self.pointStarted.emit(index, total)
+            record = {
+                "focus_index": index, "row": row, "col": col,
+                "status": "ok", "error": None,
+                "coarse": None, "medium": None,
+            }
+            fit = None
             try:
                 anchor, master_row, master_col = self.calibration.shifted_anchor_for_focus(row, col)
                 self.bridge.set_anchor(**anchor)
                 try:
                     if index == 0:
-                        z_center = self._run_sweep(master_row, master_col, z_center, self.stage_config["coarse"])
+                        coarse = self._run_sweep(master_row, master_col, z_center, self.stage_config["coarse"])
+                        record["coarse"] = coarse
+                        z_center = coarse["chosen_z"]
 
-                    z_center = self._run_sweep(master_row, master_col, z_center, self.stage_config["medium"])
+                    medium = self._run_sweep(master_row, master_col, z_center, self.stage_config["medium"])
+                    record["medium"] = medium
+                    z_center = medium["chosen_z"]
+
                     fit = self._run_fine(master_row, master_col, row, col, z_center)
                     z_center = fit.z_opt if fit.z_opt is not None else fit.max_loc
 
@@ -109,19 +125,33 @@ class AutofocusSequenceWorker(QObject):
                     # be left active once this point is done with it.
                     self.bridge.set_anchor(**self.calibration.anchor_payload())
             except Exception as e:
+                record["status"] = "failed"
+                record["error"] = str(e)
                 self.pointFailed.emit(index, str(e))
+            finally:
+                # Stashed as a raw FocusFit for now - fine stage's is_right z_opt
+                # isn't resolved until finalize_region() runs below, after every
+                # point in the region has been attempted.
+                record["_fit"] = fit
+                self.records.append(record)
 
         focus_fitting.finalize_region(self.fits)
+        for record in self.records:
+            fit = record.pop("_fit")
+            record["fine"] = fit.to_dict() if fit is not None else None
         self.sequenceFinished.emit()
 
-    def _run_sweep(self, row: int, col: int, center: float, stage: dict) -> float:
-        """Runs one coarse/medium sweep and returns its raw max-sharpness location
-        (no curve fit - that's reserved for the fine stage)."""
+    def _run_sweep(self, row: int, col: int, center: float, stage: dict) -> dict:
+        """Runs one coarse/medium sweep and returns its raw sweep data plus
+        max-sharpness location (no curve fit - that's reserved for the fine
+        stage)."""
         z_step = stage["z_step"]
         num_layers = stage["num_layers"]
         z_start = _centered_z_start(center, z_step, num_layers)
-        metric_values = self.bridge.run_autofocus(row, col, z_start, z_step, num_layers)
-        return _max_sharpness_z(z_start, z_step, metric_values)
+        metric_values = list(self.bridge.run_autofocus(row, col, z_start, z_step, num_layers))
+        z_values = [z_start + i * z_step for i in range(len(metric_values))]
+        chosen_z = _max_sharpness_z(z_start, z_step, metric_values)
+        return {"z_values": z_values, "metric_values": metric_values, "chosen_z": chosen_z}
 
     def _run_fine(self, row: int, col: int, orig_row: float, orig_col: float, center: float) -> focus_fitting.FocusFit:
         stage = self.stage_config["fine"]

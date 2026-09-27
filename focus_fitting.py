@@ -72,6 +72,24 @@ class FocusFit:
         z_vals = np.linspace(self.z[0], self.z[-1], num_points)
         return z_vals, _mixture_model(z_vals, *self.params)
 
+    def to_dict(self) -> dict:
+        """JSON-serializable snapshot of the fine stage's sweep + fit, for
+        autofocus_log.py. Only meaningful once fit() (and, for an 'is_right'
+        point, finalize_region()) has already run."""
+        return {
+            "z_values": self.z.tolist(),
+            "metric_values": self.f.tolist(),
+            # self.params is an ndarray after a successful curve_fit, but a plain
+            # list of the init guess (see fit()'s RuntimeError fallback) otherwise
+            # - float(x) covers both instead of assuming .tolist() exists.
+            "params": [float(x) for x in self.params] if self.params is not None else None,
+            "peak_locs": self.peak_locs,
+            "max_loc": self.max_loc,
+            "is_right": self.is_right,
+            "peak_offset": self.peak_offset,
+            "z_opt": self.z_opt,
+        }
+
 
 def finalize_region(fits: list[FocusFit]) -> None:
     """Ports Surface_Fitting.get_valid_focuses(): resolves any 'is_right' point's
