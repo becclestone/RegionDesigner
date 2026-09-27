@@ -2,7 +2,7 @@ import glob
 import os
 
 from PySide6.QtWidgets import (
-    QMainWindow, QToolBar, QSpinBox, QDoubleSpinBox, QPushButton, QLabel, QMessageBox, QFileDialog
+    QMainWindow, QToolBar, QSpinBox, QDoubleSpinBox, QPushButton, QLabel, QMessageBox, QFileDialog, QCheckBox
 )
 
 from canvas_view import SectionCanvas
@@ -12,6 +12,7 @@ from stage_calibration import StageCalibration
 from autofocus_client import AutofocusSequenceWorker
 from focus_review_dialog import FocusReviewDialog
 from region_plane_fit import RegionPlaneFit
+from region_scan import RegionScanWorker
 
 _DEFAULT_TARGET_REGION_SIZE = 100
 _DEFAULT_FOCUS_POINTS_PER_REGION = 4
@@ -53,6 +54,9 @@ class RegionDesignerWindow(QMainWindow):
         self._af_worker = None
         self._af_region_id: int | None = None
         self._af_region_items: list = []
+        self._review_dialog: FocusReviewDialog | None = None
+        self._scan_worker = None
+        self._scanning_region_id: int | None = None
 
         self._build_toolbar()
         self.status_label = QLabel("No calibration loaded.")
@@ -152,9 +156,33 @@ class RegionDesignerWindow(QMainWindow):
         self.run_autofocus_btn.clicked.connect(self._on_run_autofocus_clicked)
         toolbar.addWidget(self.run_autofocus_btn)
 
+        self.auto_run_autofocus_btn = QPushButton("Auto Run Autofocus for Region")
+        self.auto_run_autofocus_btn.setToolTip(
+            "Runs autofocus for the region, then automatically confirms every point via a real scan "
+            "(Auto Search, picking each point's highest-contrast capture) using the fitted peak as the starting Z."
+        )
+        self.auto_run_autofocus_btn.clicked.connect(self._on_auto_run_autofocus_clicked)
+        toolbar.addWidget(self.auto_run_autofocus_btn)
+
+        self.auto_finish_checkbox = QCheckBox("Auto-finish when confirmed")
+        self.auto_finish_checkbox.setToolTip(
+            "Checked: Auto Run also finishes the region automatically once every point is confirmed.\n"
+            "Unchecked: Auto Run stops there so you can do a final manual review before clicking "
+            "'Done Reviewing This Region' yourself."
+        )
+        toolbar.addWidget(self.auto_finish_checkbox)
+
         self.fit_plane_btn = QPushButton("Fit Region Plane")
         self.fit_plane_btn.clicked.connect(self._on_fit_plane_clicked)
         toolbar.addWidget(self.fit_plane_btn)
+
+        self.scan_region_btn = QPushButton("Scan Region")
+        self.scan_region_btn.setToolTip(
+            "Submits every painted section in this region, with its Fit Region Plane Z, as one real "
+            "multi-section scan. Run Fit Region Plane for this region first."
+        )
+        self.scan_region_btn.clicked.connect(self._on_scan_region_clicked)
+        toolbar.addWidget(self.scan_region_btn)
 
     def _on_brush_radius_changed(self, value: int):
         self.canvas.brush_radius = value
@@ -220,6 +248,12 @@ class RegionDesignerWindow(QMainWindow):
             QMessageBox.warning(self, "Load Calibration", f"Could not load calibration: {e}")
 
     def _on_run_autofocus_clicked(self):
+        self._start_autofocus_run(auto_confirm=False, auto_finish=False)
+
+    def _on_auto_run_autofocus_clicked(self):
+        self._start_autofocus_run(auto_confirm=True, auto_finish=self.auto_finish_checkbox.isChecked())
+
+    def _start_autofocus_run(self, auto_confirm: bool, auto_finish: bool):
         if self.calibration is None:
             QMessageBox.warning(self, "Run Autofocus", "Load a calibration file first.")
             return
@@ -240,10 +274,19 @@ class RegionDesignerWindow(QMainWindow):
         for item in region_items:
             item.set_status(None)
 
-        self.run_autofocus_btn.setEnabled(False)
+        self._set_hardware_controls_enabled(False)
         self.status_label.setText(f"Running autofocus for region {region_id}: 0/{len(points)}")
         self.canvas.set_region_status(region_id, "focusing")
         self.canvas.set_region_progress(region_id, 0, len(points))
+
+        # Opened now (rather than after the sequence finishes) and non-modally
+        # (show(), not exec()) so the operator can watch each point's focus
+        # curve appear as it's fitted, without it blocking the canvas.
+        dialog = FocusReviewDialog(self.bridge, self.calibration, region_id, [], parent=self)
+        dialog.set_auto_confirm(auto_confirm, auto_finish=auto_finish)
+        dialog.finished.connect(lambda result, d=dialog, rid=region_id: self._on_review_dialog_finished(rid, d, result))
+        dialog.show()
+        self._review_dialog = dialog
 
         worker = AutofocusSequenceWorker(
             self.bridge, self.calibration, points,
@@ -268,30 +311,49 @@ class RegionDesignerWindow(QMainWindow):
         if index < len(self._af_region_items):
             self._af_region_items[index].set_status("done")
         self.canvas.set_region_progress(self._af_region_id, index + 1, len(self._af_region_items))
+        if self._review_dialog is not None:
+            self._review_dialog.add_fit(fit)
 
     def _on_autofocus_point_failed(self, index: int, message: str):
         if index < len(self._af_region_items):
             self._af_region_items[index].set_status("failed")
         QMessageBox.warning(self, "Autofocus failed", f"Point {index}: {message}")
 
+    def _set_hardware_controls_enabled(self, enabled: bool):
+        """The bridge only allows one hardware-affecting operation in flight at a
+        time (see controller_bridge.py's _busy), so every button that starts one
+        - autofocus, auto-run, and a real region scan - is disabled together
+        while any one of them is running."""
+        self.run_autofocus_btn.setEnabled(enabled)
+        self.auto_run_autofocus_btn.setEnabled(enabled)
+        self.scan_region_btn.setEnabled(enabled)
+
     def _on_autofocus_sequence_finished(self, region_id: int, worker: AutofocusSequenceWorker):
-        self.run_autofocus_btn.setEnabled(True)
+        self._set_hardware_controls_enabled(True)
         self.status_label.setText(f"Autofocus done for region {region_id}: {len(worker.fits)} point(s) fitted.")
+
+        if self._review_dialog is not None:
+            self._review_dialog.finish_collecting()
 
         if not worker.fits:
             self.canvas.set_region_status(region_id, "failed")
-            return
 
-        dialog = FocusReviewDialog(self.bridge, self.calibration, region_id, worker.fits, parent=self)
-        if dialog.exec() == FocusReviewDialog.DialogCode.Accepted:
+    def _on_review_dialog_finished(self, region_id: int, dialog: FocusReviewDialog, result: int):
+        if not dialog.fits:
+            pass  # already marked "failed" in _on_autofocus_sequence_finished; nothing to confirm
+        elif result == FocusReviewDialog.DialogCode.Accepted:
             self.region_focus_points[region_id] = dialog.result_focus_points()
             self.status_label.setText(
                 f"Region {region_id}: {len(self.region_focus_points[region_id])} focus point(s) confirmed."
             )
             self.canvas.set_region_status(region_id, "confirmed")
         else:
-            # Operator declined the fit - go back to unmarked/pending so a retry is unambiguous.
+            # Operator declined the fit (or closed the dialog) - go back to
+            # unmarked/pending so a retry is unambiguous.
             self.canvas.set_region_status(region_id, None)
+
+        if self._review_dialog is dialog:
+            self._review_dialog = None
 
     def _on_fit_plane_clicked(self):
         region_id = self.region_id_spin.value()
@@ -320,6 +382,66 @@ class RegionDesignerWindow(QMainWindow):
             f"Region {region_id}: plane fit over {len(region_sections)} section(s), "
             f"max focus-point residual = {max(residuals):.4f}mm."
         )
+
+    def _on_scan_region_clicked(self):
+        if self.calibration is None:
+            QMessageBox.warning(self, "Scan Region", "Load a calibration file first.")
+            return
+        if self.bridge.is_busy():
+            QMessageBox.warning(self, "Scan Region", "Another hardware operation is already in progress.")
+            return
+
+        region_id = self.region_id_spin.value()
+        region_sections = [s for s, rid in self.canvas.region_of.items() if rid == region_id]
+        if not region_sections:
+            QMessageBox.information(self, "Scan Region", f"No painted sections found for region {region_id}.")
+            return
+
+        missing_z = [s for s in region_sections if s not in self.section_z]
+        if missing_z:
+            QMessageBox.warning(
+                self, "Scan Region",
+                f"{len(missing_z)} of region {region_id}'s section(s) have no Z yet - "
+                f"run Fit Region Plane for this region first.",
+            )
+            return
+
+        ordered_sections = clustering.serpentine_order(region_sections)
+        sections_with_z = [(row, col, self.section_z[(row, col)]) for row, col in ordered_sections]
+
+        reply = QMessageBox.question(
+            self, "Scan Region",
+            f"Scan region {region_id} now? This submits a real {len(sections_with_z)}-section scan to the "
+            f"controller - the stage will move for real.",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._set_hardware_controls_enabled(False)
+        self.status_label.setText(f"Scanning region {region_id}: {len(sections_with_z)} section(s)...")
+        self.canvas.set_region_status(region_id, "scanning")
+        self._scanning_region_id = region_id
+
+        worker = RegionScanWorker(self.bridge, self.calibration, sections_with_z)
+        worker.scanFailed.connect(self._on_region_scan_failed)
+        worker.scanFinished.connect(self._on_region_scan_finished)
+        self._scan_worker = worker  # keep alive for the duration of the scan
+        worker.start()
+
+    def _on_region_scan_finished(self):
+        region_id = self._scanning_region_id
+        self._set_hardware_controls_enabled(True)
+        self.status_label.setText(f"Region {region_id}: scan complete.")
+        self.canvas.set_region_status(region_id, "scanned")
+        self._scanning_region_id = None
+
+    def _on_region_scan_failed(self, message: str):
+        region_id = self._scanning_region_id
+        self._set_hardware_controls_enabled(True)
+        self.status_label.setText(f"Region {region_id}: scan failed.")
+        self.canvas.set_region_status(region_id, "failed")
+        self._scanning_region_id = None
+        QMessageBox.warning(self, "Scan Region", f"Scan failed: {message}")
 
     def closeEvent(self, event):
         self.bridge.shutdown()

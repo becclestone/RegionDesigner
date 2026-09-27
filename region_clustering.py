@@ -100,6 +100,21 @@ def sections_away_from_edge(sections: list[Section], margin_mm: float = EDGE_EXC
     }
 
 
+def serpentine_order(sections: list[Section]) -> list[Section]:
+    """Orders a region's sections for an efficient real scan path: row by row,
+    alternating column direction each row (boustrophedon) so the stage never
+    jumps back across a row it's already swept - same idea as
+    _get_even_clusters' center-sort above, but exact (grid cells, not fuzzy
+    cluster centers) since these are one region's actual painted sections."""
+    rows = sorted({row for row, _ in sections})
+    ordered: list[Section] = []
+    for i, row in enumerate(rows):
+        row_sections = [rc for rc in sections if rc[0] == row]
+        row_sections.sort(key=lambda rc: rc[1], reverse=(i % 2 == 1))
+        ordered.extend(row_sections)
+    return ordered
+
+
 def place_focus_points(region_sections: list[Section], num_points: int) -> list[Section]:
     """Divides a region's area into num_points sub-areas (KMeans) and returns, for
     each sub-area, the actual painted section nearest its centroid."""

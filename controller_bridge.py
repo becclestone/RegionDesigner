@@ -227,24 +227,43 @@ class ControllerBridge(QObject):
 
     def run_single_section_scan(self, row: int, col: int, z: float,
                                  timeout: float = _DEFAULT_SCAN_TIMEOUT_S) -> None:
+        """Blocking - call from a worker thread, never the GUI thread. Single-
+        section special case of run_path_scan (see its docstring for the
+        row/col convention and the cPATH_MSG mechanism itself)."""
+        self.run_path_scan([(row, col, z)], timeout=timeout)
+
+    def run_path_scan(self, sections: list[tuple[int, int, float]], timeout: float | None = None) -> None:
         """Blocking - call from a worker thread, never the GUI thread. Submits a
-        single-entry Lucas path [[row, col, z, False, 0]] via the normal cPATH_MSG
-        mechanism (validated against a real single-section scan example this
-        session - a 1-entry path is a completely normal operation). row/col here
+        multi-entry Lucas path [[row, col, z, False, 0], ...] - one entry per
+        (row, col, z) in `sections` - via the normal cPATH_MSG mechanism
+        (validated against a real single-section scan example this session; a
+        multi-entry path is the same mechanism, just longer). Each row/col here
         must already be the FINAL master-grid values (i.e. caller adds the
         calibration's offset_row/offset_col) - cSECTION_ROW/cSECTION_COL are sent
         as 0 to pin the controller's own anchor offset to zero for this call, so
-        physical positioning and the resulting output filename both depend only on
+        physical positioning and the resulting output filenames depend only on
         the row/col given here, not on whatever anchor state the controller
-        happens to hold at the moment (see stage_calibration.py)."""
+        happens to hold at the moment (see stage_calibration.py).
+
+        Tracing MsgHandler.cpp's scan_completed() (the only place cPATH_UPDATE_MSG
+        is built) and ProcessingTask.cpp's operator()/cmf_operator this session
+        confirmed it fires exactly ONCE per submitted path, after every section in
+        it has been scanned - never once per section. So there's no per-section
+        progress to report here, and `timeout` (default: _DEFAULT_SCAN_TIMEOUT_S
+        per section, to scale with a path this long taking proportionally longer)
+        is a budget for the WHOLE path, not one section."""
         if self._busy:
             raise RuntimeError("Another hardware operation is already in progress.")
+        if not sections:
+            raise ValueError("run_path_scan needs at least one (row, col, z) section.")
+        if timeout is None:
+            timeout = _DEFAULT_SCAN_TIMEOUT_S * len(sections)
         self._busy = True
         try:
             sm.safemon_action_scan()
             sleep(0.3)
 
-            path_json = json.dumps([[row, col, z, False, 0]])
+            path_json = json.dumps([[row, col, z, False, 0] for row, col, z in sections])
             payload = {
                 ic.cTAB_SENDER: "region_designer",
                 ic.cPATH_SCAN_TYPE: True,

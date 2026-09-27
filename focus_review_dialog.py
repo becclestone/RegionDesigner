@@ -1,6 +1,7 @@
 """Per-region review dialog: shows each focus point's fitted curve, lets the user
-confirm a Z via a real 3-capture comparison scan (or override manually), and won't
-hand back results until every point has an assigned Z.
+confirm a Z via a real 3-capture comparison scan - extendable one more Z at a time
+above or below that spread if the optimum still isn't in view - or override
+manually, and won't hand back results until every point has an assigned Z.
 """
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -13,7 +14,11 @@ from PySide6.QtWidgets import (
 
 import focus_fitting
 import image_utils
+import confirmation_scan
 from confirmation_scan import ConfirmationScanWorker
+
+_AUTO_SEARCH_MAX_EXTRA = 3  # on top of the initial 3-point spread, so 6 images total
+_AUTO_SEARCH_LABEL = "Auto Search for Max Contrast (≤3 extra images)"
 
 
 class FocusReviewDialog(QDialog):
@@ -26,11 +31,28 @@ class FocusReviewDialog(QDialog):
         self.fits = fits
         self.confirmed_z: dict[int, float] = {}
         self._scan_worker = None
+        self._scan_captures: list[confirmation_scan.ScanCapture] = []  # current point's captures, sorted by z
+        self._scan_busy = False  # a confirm/extend scan worker is running right now
+        self._auto_search_active = False  # an auto-search chain is in progress (see _continue_auto_search)
+        self._auto_search_extra_used = 0
+        # "Auto Run Autofocus for Region" mode (see set_auto_confirm): once the
+        # region's autofocus finishes, automatically Auto-Search-confirm every
+        # point in turn and pick each one's highest-contrast capture, instead of
+        # waiting for the operator to do it point by point.
+        self._auto_confirm_region = False
+        self._auto_finish_region = False
+        self._auto_confirm_skip: set[int] = set()  # indices with nothing to search from (no z_opt) or a fully failed scan
+        # True while the region's AutofocusSequenceWorker is still running on the
+        # bridge - a confirmation scan must not run concurrently with it (the
+        # bridge only allows one hardware-affecting call in flight at a time).
+        self._collecting = True
 
         self._build_ui()
         self._populate_list()
         if self.fits:
             self.list_widget.setCurrentRow(0)
+        self._update_collecting_ui()
+        self._refresh_scan_controls()
 
     def _build_ui(self):
         root = QHBoxLayout(self)
@@ -59,6 +81,19 @@ class FocusReviewDialog(QDialog):
         self.capture_row = QHBoxLayout()
         right.addLayout(self.capture_row)
 
+        extend_row = QHBoxLayout()
+        self.extend_down_btn = QPushButton("+ Add point below lowest Z")
+        self.extend_down_btn.clicked.connect(lambda: self._on_extend_scan(-1))
+        extend_row.addWidget(self.extend_down_btn)
+        self.extend_up_btn = QPushButton("+ Add point above highest Z")
+        self.extend_up_btn.clicked.connect(lambda: self._on_extend_scan(1))
+        extend_row.addWidget(self.extend_up_btn)
+        right.addLayout(extend_row)
+
+        self.auto_search_btn = QPushButton(_AUTO_SEARCH_LABEL)
+        self.auto_search_btn.clicked.connect(self._on_auto_search)
+        right.addWidget(self.auto_search_btn)
+
         manual_box = QGroupBox("Manual override")
         manual_layout = QHBoxLayout(manual_box)
         self.manual_z_spin = QDoubleSpinBox()
@@ -79,6 +114,52 @@ class FocusReviewDialog(QDialog):
         for i in range(len(self.fits)):
             self.list_widget.addItem(QListWidgetItem(self._label_for(i)))
 
+    def set_auto_confirm(self, enabled: bool, auto_finish: bool = False):
+        """Called by main_window right after construction, before the region's
+        autofocus sequence starts. If enabled, finish_collecting() will drive
+        every point through Auto Search and pick its best capture automatically;
+        auto_finish additionally accepts the dialog once the last point is done,
+        instead of leaving 'Done Reviewing This Region' for the operator."""
+        self._auto_confirm_region = enabled
+        self._auto_finish_region = auto_finish
+
+    def add_fit(self, fit: focus_fitting.FocusFit):
+        """Appends one point's just-fitted curve, called live as the region's
+        autofocus sequence collects each point (see main_window's pointFitted
+        handler) so the operator can review already-fitted points without
+        waiting for the whole region to finish."""
+        self.fits.append(fit)
+        index = len(self.fits) - 1
+        self.list_widget.addItem(QListWidgetItem(self._label_for(index)))
+        if self.list_widget.currentRow() < 0:
+            self.list_widget.setCurrentRow(index)
+
+    def _update_collecting_ui(self):
+        if self._collecting:
+            self.accept_btn.setEnabled(False)
+            self.accept_btn.setText("Collecting autofocus data...")
+        elif not self.fits:
+            self.accept_btn.setEnabled(False)
+            self.accept_btn.setText("Autofocus failed - nothing to review")
+        else:
+            self.accept_btn.setEnabled(True)
+            self.accept_btn.setText("Done Reviewing This Region")
+
+    def finish_collecting(self):
+        """Called once the region's AutofocusSequenceWorker has finished (all
+        points attempted, z_opt values finalized) - unblocks review/accept."""
+        self._collecting = False
+        self._update_collecting_ui()
+        self._refresh_scan_controls()
+        # z_opt for any 'is_right' point is only resolved by finalize_region()
+        # once the whole region is in, so refresh the currently shown plot/label
+        # in case the selected point's z_opt just changed.
+        self._on_point_selected(self.list_widget.currentRow())
+
+        if self._auto_confirm_region and self.fits:
+            self._auto_confirm_skip = set()
+            self._advance_auto_confirm_region()
+
     def _label_for(self, index: int) -> str:
         fit = self.fits[index]
         mark = "OK" if index in self.confirmed_z else "..."
@@ -89,7 +170,7 @@ class FocusReviewDialog(QDialog):
             self.list_widget.item(i).setText(self._label_for(i))
 
     def _on_point_selected(self, row: int):
-        self._clear_capture_row()
+        self._reset_scan_session()
         if row < 0 or row >= len(self.fits):
             return
         fit = self.fits[row]
@@ -130,7 +211,31 @@ class FocusReviewDialog(QDialog):
             if widget is not None:
                 widget.deleteLater()
 
+    def _reset_scan_session(self):
+        """Drops the currently-displayed captures (switching points, or about to
+        start a fresh Confirm via Scan/Auto Search) - captures only ever apply to
+        one point - and cancels any auto-search chain in progress for it."""
+        self._scan_captures = []
+        self._auto_search_active = False
+        self.auto_search_btn.setText(_AUTO_SEARCH_LABEL)
+        self._clear_capture_row()
+        self._refresh_scan_controls()
+
+    def _refresh_scan_controls(self):
+        can_scan = not self._collecting and not self._scan_busy
+        self.confirm_btn.setEnabled(can_scan)
+        self.auto_search_btn.setEnabled(can_scan)
+        has_captures = bool(self._scan_captures)
+        self.extend_down_btn.setEnabled(can_scan and has_captures)
+        self.extend_up_btn.setEnabled(can_scan and has_captures)
+
     def _on_confirm_via_scan(self):
+        if self._collecting:
+            QMessageBox.information(
+                self, "Confirm via Scan",
+                "Autofocus is still collecting this region's points - wait for it to finish before confirming via scan.",
+            )
+            return
         index = self.list_widget.currentRow()
         if index < 0:
             return
@@ -140,18 +245,151 @@ class FocusReviewDialog(QDialog):
             QMessageBox.warning(self, "Confirm via Scan", "No candidate Z to confirm yet.")
             return
 
-        self.confirm_btn.setEnabled(False)
-        self._clear_capture_row()
+        self._reset_scan_session()
+        self._start_scan(index, fit, confirmation_scan.initial_z_values(chosen_z))
 
-        worker = ConfirmationScanWorker(self.bridge, self.calibration, row=int(round(fit.row)), col=int(round(fit.col)),
-                                         chosen_z=chosen_z)
+    def _on_extend_scan(self, direction: int):
+        """direction=+1 adds one more point one step above the highest Z captured
+        so far for this point, -1 adds one below the lowest - for when the true
+        optimum turns out to lie outside the initial Z, Z-1um, Z+1um spread."""
+        if self._collecting or self._scan_busy or not self._scan_captures:
+            return
+        index = self.list_widget.currentRow()
+        if index < 0:
+            return
+        fit = self.fits[index]
+        zs = [c.z for c in self._scan_captures]
+        edge_z = max(zs) if direction > 0 else min(zs)
+        next_z = edge_z + direction * confirmation_scan.MICRON_MM
+        self._start_scan(index, fit, [next_z])
+
+    def _on_auto_search(self):
+        """Runs the initial 3-point spread, then automatically keeps extending
+        toward whichever edge holds the highest contrast - one point at a time -
+        until the max is bracketed by its neighbors (the true peak is in view) or
+        _AUTO_SEARCH_MAX_EXTRA extra images have been taken (6 total)."""
+        if self._collecting:
+            QMessageBox.information(
+                self, "Auto Search",
+                "Autofocus is still collecting this region's points - wait for it to finish before searching.",
+            )
+            return
+        if self._scan_busy:
+            return
+        index = self.list_widget.currentRow()
+        if index < 0:
+            return
+        fit = self.fits[index]
+        chosen_z = self.confirmed_z.get(index, fit.z_opt)
+        if chosen_z is None:
+            QMessageBox.warning(self, "Auto Search", "No candidate Z to search from yet.")
+            return
+
+        self._reset_scan_session()
+        self._auto_search_active = True
+        self._auto_search_extra_used = 0
+        self.auto_search_btn.setText("Auto searching...")
+        self._start_scan(index, fit, confirmation_scan.initial_z_values(chosen_z))
+
+    def _continue_auto_search(self) -> bool:
+        """Returns True if another extension scan was started, False if the
+        search stopped (peak bracketed, budget spent, or nothing to go on)."""
+        if self._auto_search_extra_used >= _AUTO_SEARCH_MAX_EXTRA or not self._scan_captures:
+            return False
+        index = self.list_widget.currentRow()
+        if index < 0:
+            return False
+
+        best_i = max(range(len(self._scan_captures)), key=lambda i: self._scan_captures[i].contrast_score)
+        if 0 < best_i < len(self._scan_captures) - 1:
+            return False  # highest contrast already has a lower neighbor on each side - peak's in view
+
+        direction = 1 if best_i == len(self._scan_captures) - 1 else -1
+        next_z = self._scan_captures[best_i].z + direction * confirmation_scan.MICRON_MM
+        self._auto_search_extra_used += 1
+        self._start_scan(index, self.fits[index], [next_z])
+        return True
+
+    def _start_scan(self, index: int, fit, z_values: list[float]):
+        self._scan_busy = True
+        self._refresh_scan_controls()
+
+        # fit.row/fit.col are LOCAL section coordinates (see autofocus_client.py);
+        # run_single_section_scan needs FINAL master-grid row/col, i.e. offset by
+        # this calibration's own master-grid address (see stage_calibration.py's
+        # section_to_absolute_xy/shifted_anchor_for_focus, which do the same add).
+        master_row = int(round(self.calibration.offset_row + fit.row))
+        master_col = int(round(self.calibration.offset_col + fit.col))
+        worker = ConfirmationScanWorker(self.bridge, self.calibration, row=master_row, col=master_col,
+                                         z_values=z_values)
         worker.captureReady.connect(lambda capture, idx=index: self._on_capture_ready(idx, capture))
         worker.captureFailed.connect(self._on_capture_failed)
-        worker.sequenceFinished.connect(lambda: self.confirm_btn.setEnabled(True))
+        worker.sequenceFinished.connect(self._on_scan_sequence_finished)
         self._scan_worker = worker  # keep alive for the duration of the sequence
         worker.start()
 
+    def _on_scan_sequence_finished(self):
+        self._scan_busy = False
+        if self._auto_search_active:
+            if self._continue_auto_search():
+                return
+            self._auto_search_active = False
+            self.auto_search_btn.setText(_AUTO_SEARCH_LABEL)
+            if self._auto_confirm_region:
+                self._auto_pick_best_and_continue()
+                return
+        self._refresh_scan_controls()
+
+    def _auto_pick_best_and_continue(self):
+        """Called once a point's Auto Search chain (started by
+        _advance_auto_confirm_region) has stopped - picks that point's
+        highest-contrast capture as its confirmed Z, same as clicking 'Pick this
+        Z' on it, then moves auto-confirm on to the next point."""
+        index = self.list_widget.currentRow()
+        if index >= 0:
+            if self._scan_captures:
+                best = max(self._scan_captures, key=lambda c: c.contrast_score)
+                self._on_pick_z(index, best.z)
+            else:
+                # every capture for this point failed - nothing to pick from;
+                # leave it unconfirmed rather than looping on it forever.
+                self._auto_confirm_skip.add(index)
+        self._advance_auto_confirm_region()
+
+    def _advance_auto_confirm_region(self):
+        """Moves 'Auto Run Autofocus for Region' on to the next not-yet-confirmed
+        point, or finishes up once every point has been handled."""
+        next_index = next(
+            (i for i in range(len(self.fits)) if i not in self.confirmed_z and i not in self._auto_confirm_skip),
+            None,
+        )
+        if next_index is None:
+            self._auto_confirm_region = False
+            if self._auto_finish_region:
+                self._on_accept()
+            else:
+                self._refresh_scan_controls()
+            return
+
+        if self.fits[next_index].z_opt is None:
+            # nothing to search from for this point - skip it rather than stalling.
+            self._auto_confirm_skip.add(next_index)
+            self._advance_auto_confirm_region()
+            return
+
+        self.list_widget.setCurrentRow(next_index)
+        self._on_auto_search()
+
     def _on_capture_ready(self, index: int, capture):
+        self._scan_captures.append(capture)
+        self._scan_captures.sort(key=lambda c: c.z)
+
+        self._clear_capture_row()
+        for c in self._scan_captures:
+            self.capture_row.addWidget(self._build_capture_panel(index, c))
+        self._refresh_scan_controls()
+
+    def _build_capture_panel(self, index: int, capture) -> QWidget:
         image = tifffile.imread(capture.image_path)
         pixmap = image_utils.float_image_to_pixmap(image)
 
@@ -164,7 +402,7 @@ class FocusReviewDialog(QDialog):
         pick_btn = QPushButton("Pick this Z")
         pick_btn.clicked.connect(lambda _, idx=index, z=capture.z: self._on_pick_z(idx, z))
         layout.addWidget(pick_btn)
-        self.capture_row.addWidget(panel)
+        return panel
 
     def _on_capture_failed(self, z: float, message: str):
         QMessageBox.warning(self, "Confirmation scan failed", f"Z={z:.4f}: {message}")

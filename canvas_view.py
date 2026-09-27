@@ -64,18 +64,23 @@ _LABEL_BG_COLOR = QColor(0, 0, 0, 170)
 
 _GRID_LINE_COLOR = QColor(255, 255, 0, 70)
 
-# Focusing-progress overlay: keyed by SectionCanvas.region_status's values
-# ("focusing" / "confirmed" / "failed"), drawn on top of the region's normal
-# outline so progress is visible without opening the focus review dialog.
+# Region-progress overlay: keyed by SectionCanvas.region_status's values
+# ("focusing" / "confirmed" / "failed" / "scanning" / "scanned"), drawn on top of
+# the region's normal outline so progress is visible without opening the focus
+# review dialog.
 _STATUS_FILL_COLORS = {
     "focusing": QColor(255, 200, 0, 40),
     "confirmed": QColor(60, 220, 90, 45),
     "failed": QColor(230, 60, 60, 55),
+    "scanning": QColor(60, 140, 220, 45),
+    "scanned": QColor(30, 160, 160, 50),
 }
 _STATUS_LABEL_BG_COLORS = {
     "focusing": QColor(200, 140, 0, 220),
     "confirmed": QColor(30, 140, 60, 220),
     "failed": QColor(180, 40, 40, 220),
+    "scanning": QColor(30, 90, 170, 220),
+    "scanned": QColor(20, 110, 110, 220),
 }
 
 
@@ -109,7 +114,7 @@ class SectionCanvas(QGraphicsView):
         self.region_of: dict[Section, int] = {}
         self.draw_mode = True  # False once regions are compiled - brush is inactive until cleared
         self.active_region_id: int | None = None  # region currently being scanned - drawn highlighted
-        self.region_status: dict[int, str] = {}  # region_id -> "focusing" | "confirmed" | "failed"
+        self.region_status: dict[int, str] = {}  # region_id -> "focusing" | "confirmed" | "failed" | "scanning" | "scanned"
         self.region_progress: dict[int, tuple[int, int]] = {}  # region_id -> (points done, total)
         self.show_grid = False  # overlay of section-grid lines, toggled from the toolbar
 
@@ -422,16 +427,21 @@ class SectionCanvas(QGraphicsView):
         """Draws the region's scan-order number (its region_id, which clustering
         already assigns in serpentine scan order) at the region's centroid, so the
         operator can read the intended scan order straight off the canvas. When a
-        focusing run has touched this region, the label also reports progress
-        ("running autofocus" -> "n/total", then a confirmed/failed mark) and its
-        background is tinted to match, so status is visible without opening the
-        focus review dialog."""
+        focusing run - or a real region scan - has touched this region, the label
+        also reports progress ("running autofocus" -> "n/total", then a
+        confirmed/failed mark; "scanning" while a real scan is in flight, then
+        "scanned") and its background is tinted to match, so status is visible
+        without opening the focus review dialog."""
         if status == "focusing" and progress is not None:
             text = f"{region_id} ({progress[0]}/{progress[1]})"
         elif status == "confirmed":
             text = f"{region_id} ✓"
         elif status == "failed":
             text = f"{region_id} ✗"
+        elif status == "scanning":
+            text = f"{region_id} (scanning)"
+        elif status == "scanned":
+            text = f"{region_id} (scanned)"
         else:
             text = str(region_id)
         font = QFont()
@@ -461,9 +471,9 @@ class SectionCanvas(QGraphicsView):
             self._redraw_mask()
 
     def set_region_status(self, region_id: int, status: str | None):
-        """Marks a region's focusing progress state ("focusing"/"confirmed"/
-        "failed", or None to go back to unmarked/pending) - see _draw_region_label
-        and the fill overlay in _redraw_mask for how this is drawn."""
+        """Marks a region's progress state ("focusing"/"confirmed"/"failed"/
+        "scanning"/"scanned", or None to go back to unmarked/pending) - see
+        _draw_region_label and the fill overlay in _redraw_mask for how this is drawn."""
         if status is None:
             self.region_status.pop(region_id, None)
         else:

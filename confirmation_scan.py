@@ -1,6 +1,9 @@
 """Runs the 'confirm via a real scan' step: single-section Lucas-path captures at
-chosen-Z, chosen-Z-1um and chosen-Z+1um, scored by 99th-percentile contrast on each
-capture's NR reconstruction, for the user to visually compare and pick from.
+a given list of Z values, scored by 99th-percentile contrast on each capture's NR
+reconstruction, for the user to visually compare and pick from. The initial call
+uses initial_z_values() (chosen-Z, chosen-Z-1um, chosen-Z+1um); focus_review_dialog
+can then run this again for one more Z beyond either end of that spread, in case
+the true optimum turns out to lie outside it.
 
 There's no standalone controller command for "capture + view at one forced Z" -
 confirmed by research this session that FocusCalibrationTask does pure motion (no
@@ -19,7 +22,7 @@ import tifffile
 from PySide6.QtCore import QObject, Signal
 
 IMAGES_ROOT = os.path.expanduser("~/Development/ILLUMISONICS/Gander/IMAGES")
-_MICRON_MM = 0.001
+MICRON_MM = 0.001  # public: focus_review_dialog uses this to step the "add a point above/below" extension
 
 # The reconstruction/save pipeline writes the NR tif some time after the scan
 # itself reports cPATH_UPDATE_MSG complete - observed delay is up to ~20s, so the
@@ -80,18 +83,23 @@ def score_nr_image(run_folder: str, row: int, col: int) -> tuple:
     return image_path, float(np.percentile(image, 99))
 
 
+def initial_z_values(chosen_z: float) -> list[float]:
+    """The starting 3-point spread around the algorithm/manual pick."""
+    return [chosen_z - MICRON_MM, chosen_z, chosen_z + MICRON_MM]
+
+
 class ConfirmationScanWorker(QObject):
     captureReady = Signal(object)       # ScanCapture
     captureFailed = Signal(float, str)  # z, error message
     sequenceFinished = Signal()
 
-    def __init__(self, bridge, calibration, row: int, col: int, chosen_z: float):
+    def __init__(self, bridge, calibration, row: int, col: int, z_values: list[float]):
         super().__init__()
         self.bridge = bridge
         self.calibration = calibration
         self.row = row
         self.col = col
-        self.z_values = [chosen_z - _MICRON_MM, chosen_z, chosen_z + _MICRON_MM]
+        self.z_values = z_values
 
     def start(self):
         Thread(target=self._run, daemon=True).start()
