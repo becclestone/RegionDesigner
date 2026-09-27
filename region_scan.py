@@ -7,6 +7,18 @@ scan_completed() (the only place cPATH_UPDATE_MSG is built) fires exactly once,
 after the whole path finishes, confirmed by tracing ProcessingTask.cpp's
 operator()/cmf_operator this session - so this worker can only report started/
 failed/finished, not per-section progress.
+
+KNOWN TRADEOFF: this is an OPEN-LOOP scan - every section drives straight to its
+precomputed plane-fit Z with no live refinement. DOVER_UI's own "Image-Path" Scan
+button instead runs CLOSED-LOOP (cIS_LUCAS_PATH: False), live-autofocusing
+designated "focus-owner" sections during the scan itself and propagating that
+result to neighbors - see run_path_scan's docstring for the full trace. So a
+region scanned here can look softer than the same region scanned from DOVER_UI if
+the plane fit didn't perfectly capture the tissue's real tilt/drift. Matching
+DOVER_UI's closed-loop behavior would mean sending the focus-owner/donor path
+structure (section_utilities.py's find_focus_donor) instead of a literal Z per
+section - a materially different (and much slower, since it live-autofocuses)
+feature, not implemented here by design for now.
 """
 from threading import Thread
 

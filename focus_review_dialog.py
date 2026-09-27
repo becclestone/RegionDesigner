@@ -32,6 +32,7 @@ class FocusReviewDialog(QDialog):
         self.confirmed_z: dict[int, float] = {}
         self._scan_worker = None
         self._scan_captures: list[confirmation_scan.ScanCapture] = []  # current point's captures, sorted by z
+        self._captures_by_index: dict[int, list[confirmation_scan.ScanCapture]] = {}  # survives switching points
         self._scan_busy = False  # a confirm/extend scan worker is running right now
         self._auto_search_active = False  # an auto-search chain is in progress (see _continue_auto_search)
         self._auto_search_extra_used = 0
@@ -170,7 +171,7 @@ class FocusReviewDialog(QDialog):
             self.list_widget.item(i).setText(self._label_for(i))
 
     def _on_point_selected(self, row: int):
-        self._reset_scan_session()
+        self._load_scan_session(row)
         if row < 0 or row >= len(self.fits):
             return
         fit = self.fits[row]
@@ -211,10 +212,22 @@ class FocusReviewDialog(QDialog):
             if widget is not None:
                 widget.deleteLater()
 
-    def _reset_scan_session(self):
-        """Drops the currently-displayed captures (switching points, or about to
-        start a fresh Confirm via Scan/Auto Search) - captures only ever apply to
-        one point - and cancels any auto-search chain in progress for it."""
+    def _load_scan_session(self, row: int):
+        """Switching points - restores this point's previously-captured comparison
+        images (if any), instead of dropping them, and cancels any auto-search
+        chain in progress for the point being left."""
+        self._auto_search_active = False
+        self.auto_search_btn.setText(_AUTO_SEARCH_LABEL)
+        self._scan_captures = list(self._captures_by_index.get(row, []))
+        self._clear_capture_row()
+        for c in self._scan_captures:
+            self.capture_row.addWidget(self._build_capture_panel(row, c))
+        self._refresh_scan_controls()
+
+    def _clear_scan_session(self, index: int):
+        """Discards this point's previous comparison captures - called right
+        before starting a brand new Confirm via Scan/Auto Search sequence for it."""
+        self._captures_by_index.pop(index, None)
         self._scan_captures = []
         self._auto_search_active = False
         self.auto_search_btn.setText(_AUTO_SEARCH_LABEL)
@@ -245,7 +258,7 @@ class FocusReviewDialog(QDialog):
             QMessageBox.warning(self, "Confirm via Scan", "No candidate Z to confirm yet.")
             return
 
-        self._reset_scan_session()
+        self._clear_scan_session(index)
         self._start_scan(index, fit, confirmation_scan.initial_z_values(chosen_z))
 
     def _on_extend_scan(self, direction: int):
@@ -285,7 +298,7 @@ class FocusReviewDialog(QDialog):
             QMessageBox.warning(self, "Auto Search", "No candidate Z to search from yet.")
             return
 
-        self._reset_scan_session()
+        self._clear_scan_session(index)
         self._auto_search_active = True
         self._auto_search_extra_used = 0
         self.auto_search_btn.setText("Auto searching...")
@@ -383,6 +396,7 @@ class FocusReviewDialog(QDialog):
     def _on_capture_ready(self, index: int, capture):
         self._scan_captures.append(capture)
         self._scan_captures.sort(key=lambda c: c.z)
+        self._captures_by_index[index] = list(self._scan_captures)
 
         self._clear_capture_row()
         for c in self._scan_captures:
@@ -405,6 +419,13 @@ class FocusReviewDialog(QDialog):
         return panel
 
     def _on_capture_failed(self, z: float, message: str):
+        if self._auto_confirm_region:
+            # A modal box here would silently block the whole unattended region
+            # run waiting for a click nobody's there to give - _continue_auto_search
+            # and _auto_pick_best_and_continue already cope with a capture missing
+            # from _scan_captures, so just note it and let the chain carry on.
+            self.z_label.setText(f"Auto Search: capture at Z={z:.4f} failed ({message}) - continuing")
+            return
         QMessageBox.warning(self, "Confirmation scan failed", f"Z={z:.4f}: {message}")
 
     def _on_pick_z(self, index: int, z: float):

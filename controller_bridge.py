@@ -62,6 +62,14 @@ def _drain(q: Queue) -> None:
 class ControllerBridge(QObject):
     imageReady = Signal(str)
     commandError = Signal(str)
+    # Live per-section scan/reconstruction progress - master-grid row/col, and
+    # whether the section just entered (True) or left (False) that state. Same
+    # cPATH_SCAN_ON/OFF_MSG and cRECON_ON/OFF_MSG broadcasts DOVER_UI's own
+    # demo_control_a.py uses to color its scan-path canvas per section; unlike
+    # cPATH_UPDATE_MSG (see run_path_scan's docstring), these fire once per
+    # section, independent of whether the path itself is open- or closed-loop.
+    sectionScanning = Signal(int, int, bool)        # master_row, master_col, is_scanning
+    sectionReconstructing = Signal(int, int, bool)  # master_row, master_col, is_reconstructing
 
     def __init__(self):
         super().__init__()
@@ -114,6 +122,16 @@ class ControllerBridge(QObject):
             self._autofocus_reply_queue.put(msg.get_msg_payload())
         elif msg_type == ic.cPATH_UPDATE_MSG:
             self._path_reply_queue.put(("update", msg.get_msg_payload()))
+        elif msg_type in (ic.cPATH_SCAN_ON_MSG, ic.cPATH_SCAN_OFF_MSG):
+            payload = msg.get_msg_payload()
+            self.sectionScanning.emit(
+                payload[ic.cSECTION_ROW], payload[ic.cSECTION_COL], msg_type == ic.cPATH_SCAN_ON_MSG
+            )
+        elif msg_type in (ic.cRECON_ON_MSG, ic.cRECON_OFF_MSG):
+            payload = msg.get_msg_payload()
+            self.sectionReconstructing.emit(
+                payload[ic.cSECTION_ROW], payload[ic.cSECTION_COL], msg_type == ic.cRECON_ON_MSG
+            )
         elif msg_type == src.cREPLY_MSG and msg.get_msg_reply_type() == ic.cPATH_MSG:
             self._path_reply_queue.put(("ack", msg.get_msg_payload()))
         elif msg_type == src.cREPLY_MSG and msg.get_msg_reply_type() == ic.cSET_ANCHOR_POINT_MSG:
@@ -225,6 +243,24 @@ class ControllerBridge(QObject):
         finally:
             self._busy = False
 
+    def send_scan_section_binding_rect(self, tl: tuple[int, int], br: tuple[int, int]) -> None:
+        """Fire-and-forget, mirrors DOVER_UI's Utilities/path_utilites.py:
+        send_scan_section_binding_rect. Tells the Stitcher the master-grid
+        row/col bounding box (inclusive) of the sections about to be scanned,
+        which it needs to allocate the final stitched output image - must be
+        sent before run_path_scan below, not after, since run_path_scan here
+        blocks until the whole path finishes (unlike DOVER_UI's own
+        fire-and-forget path send)."""
+        payload = {
+            ic.cRECTANGLE_TL_ROW_PARAM: tl[0],
+            ic.cRECTANGLE_TL_COL_PARAM: tl[1],
+            ic.cRECTANGLE_BR_ROW_PARAM: br[0],
+            ic.cRECTANGLE_BR_COL_PARAM: br[1],
+        }
+        msg = TIsMsg.create_cmd_msg(ic.cIMAGE_RECTANGLE_SIZE_CMD, ic.STITCHER_TARGET)
+        msg.add_msg_payload(payload)
+        msg.send_q_destroy()
+
     def run_single_section_scan(self, row: int, col: int, z: float,
                                  timeout: float = _DEFAULT_SCAN_TIMEOUT_S) -> None:
         """Blocking - call from a worker thread, never the GUI thread. Single-
@@ -251,7 +287,24 @@ class ControllerBridge(QObject):
         it has been scanned - never once per section. So there's no per-section
         progress to report here, and `timeout` (default: _DEFAULT_SCAN_TIMEOUT_S
         per section, to scale with a path this long taking proportionally longer)
-        is a budget for the WHOLE path, not one section."""
+        is a budget for the WHOLE path, not one section.
+
+        KNOWN TRADEOFF vs DOVER_UI's own "Image-Path" Scan button: cIS_LUCAS_PATH:
+        True below routes the controller to ProcessingTask.cpp's
+        calculated_path_operator - an open-loop operator that drives straight to
+        the given z with no live refinement. DOVER_UI's real Scan button instead
+        sends cIS_LUCAS_PATH: False (Utilities/path_utilites.py's send_path),
+        which routes to cmf_operator/calculated_plane_operator - a closed-loop
+        operator that live-autofocuses on designated "focus-owner" sections
+        during the scan itself and propagates that measured Z to neighboring
+        sections via a donor scheme (section_utilities.py's find_focus_donor).
+        So a Lucas-path scan's image sharpness depends entirely on how accurate
+        the given z already is (RegionDesigner's own autofocus+confirm+plane-fit
+        pipeline) - it will never self-correct drift/tilt the way a real Scan
+        does. Confirmed by tracing MsgHandler.cpp/ProcessingTask.cpp/
+        section_utilities.py this session; not something this method can fix by
+        itself (would require sending the focus-owner/donor path structure
+        instead of a literal z per section, i.e. a different feature)."""
         if self._busy:
             raise RuntimeError("Another hardware operation is already in progress.")
         if not sections:
@@ -260,6 +313,14 @@ class ControllerBridge(QObject):
             timeout = _DEFAULT_SCAN_TIMEOUT_S * len(sections)
         self._busy = True
         try:
+            # Tell the Stitcher the output image's tile-grid bounding box before
+            # driving the scan, for every path length including a single (1x1)
+            # section - this call blocks until the whole path completes, so the
+            # Stitcher must learn the size up front rather than after.
+            rows = [row for row, col, z in sections]
+            cols = [col for row, col, z in sections]
+            self.send_scan_section_binding_rect((min(rows), min(cols)), (max(rows), max(cols)))
+
             sm.safemon_action_scan()
             sleep(0.3)
 

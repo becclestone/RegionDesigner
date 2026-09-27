@@ -47,6 +47,8 @@ class RegionDesignerWindow(QMainWindow):
         self.bridge = ControllerBridge()
         self.bridge.imageReady.connect(self._on_image_ready)
         self.bridge.commandError.connect(self._on_command_error)
+        self.bridge.sectionScanning.connect(self._on_section_scanning)
+        self.bridge.sectionReconstructing.connect(self._on_section_reconstructing)
 
         self.calibration: StageCalibration | None = None
         self.region_focus_points: dict[int, list[tuple[float, float, float]]] = {}  # region_id -> [(row,col,z)]
@@ -179,7 +181,11 @@ class RegionDesignerWindow(QMainWindow):
         self.scan_region_btn = QPushButton("Scan Region")
         self.scan_region_btn.setToolTip(
             "Submits every painted section in this region, with its Fit Region Plane Z, as one real "
-            "multi-section scan. Run Fit Region Plane for this region first."
+            "multi-section scan. Run Fit Region Plane for this region first.\n"
+            "Known tradeoff: this scan is open-loop (drives straight to the precomputed Z, no live "
+            "refocus), unlike DOVER_UI's own Image-Path Scan button which live-autofocuses during the "
+            "scan - so results can look softer than a real DOVER_UI scan if the plane fit didn't "
+            "perfectly capture the tissue's tilt/drift. See region_scan.py's module docstring."
         )
         self.scan_region_btn.clicked.connect(self._on_scan_region_clicked)
         toolbar.addWidget(self.scan_region_btn)
@@ -198,6 +204,23 @@ class RegionDesignerWindow(QMainWindow):
 
     def _on_command_error(self, message: str):
         QMessageBox.warning(self, "Controller error", message)
+
+    def _on_section_scanning(self, master_row: int, master_col: int, active: bool):
+        self._set_section_activity(master_row, master_col, "scanning" if active else None)
+
+    def _on_section_reconstructing(self, master_row: int, master_col: int, active: bool):
+        self._set_section_activity(master_row, master_col, "reconstructing" if active else None)
+
+    def _set_section_activity(self, master_row: int, master_col: int, activity: str | None):
+        """master_row/master_col are master-grid (absolute) coordinates, as the
+        controller reports them - convert back to the canvas's local (unshifted)
+        section coordinates via the calibration's offset, the inverse of
+        RegionScanWorker's local -> master conversion."""
+        if self.calibration is None:
+            return
+        row = int(round(master_row - self.calibration.offset_row))
+        col = int(round(master_col - self.calibration.offset_col))
+        self.canvas.set_section_activity(row, col, activity)
 
     def _on_compile_regions_clicked(self):
         sections = list(self.canvas.painted)
@@ -412,7 +435,10 @@ class RegionDesignerWindow(QMainWindow):
         reply = QMessageBox.question(
             self, "Scan Region",
             f"Scan region {region_id} now? This submits a real {len(sections_with_z)}-section scan to the "
-            f"controller - the stage will move for real.",
+            f"controller - the stage will move for real.\n\n"
+            f"Note: this scan is open-loop (drives straight to the Fit Region Plane Z, no live refocus), "
+            f"unlike DOVER_UI's own Image-Path Scan button which live-autofocuses during the scan - so "
+            f"results can look softer if the plane fit didn't perfectly capture the tissue's tilt/drift.",
         )
         if reply != QMessageBox.StandardButton.Yes:
             return

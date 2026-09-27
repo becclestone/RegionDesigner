@@ -83,6 +83,19 @@ _STATUS_LABEL_BG_COLORS = {
     "scanned": QColor(20, 110, 110, 220),
 }
 
+# Live per-section scan/reconstruction overlay (see SectionCanvas.section_activity
+# and set_section_activity) - drawn per painted section, on top of the coarser
+# region-level tint above, as ControllerBridge's sectionScanning/
+# sectionReconstructing signals report individual sections starting/finishing.
+# Mirrors DOVER_UI's own colored-box scan/recon overlay (demo_control_a.py):
+# solid gold/red there since it draws opaque PNG tiles, translucent here since
+# this canvas fills directly over the section's normal appearance instead of
+# replacing it.
+_SECTION_ACTIVITY_COLORS = {
+    "scanning": QColor(255, 220, 0, 130),
+    "reconstructing": QColor(60, 220, 90, 130),
+}
+
 
 class SectionCanvas(QGraphicsView):
     sectionsChanged = Signal()
@@ -116,6 +129,7 @@ class SectionCanvas(QGraphicsView):
         self.active_region_id: int | None = None  # region currently being scanned - drawn highlighted
         self.region_status: dict[int, str] = {}  # region_id -> "focusing" | "confirmed" | "failed" | "scanning" | "scanned"
         self.region_progress: dict[int, tuple[int, int]] = {}  # region_id -> (points done, total)
+        self.section_activity: dict[Section, str] = {}  # (row,col) -> "scanning" | "reconstructing"
         self.show_grid = False  # overlay of section-grid lines, toggled from the toolbar
 
         self.brush_radius = 4  # radius in section-width units (true circular radius in scene pixels)
@@ -341,41 +355,44 @@ class SectionCanvas(QGraphicsView):
         region_centroid_sum: dict[int, list[float]] = {}  # region_id -> [sum_x, sum_y, count]
         for (row, col) in self.painted:
             region_id = self.region_of.get((row, col))
+            x, y, w, h = geom.section_to_pixel_rect(row, col, self.anchor, self.zoom)
+
             if region_id is None:
                 # Not yet clustered into a region - just show what's been painted.
-                x, y, w, h = geom.section_to_pixel_rect(row, col, self.anchor, self.zoom)
                 painter.fillRect(QRectF(x, y, w, h), _PAINTED_COLOR)
-                continue
+            else:
+                entry = region_centroid_sum.setdefault(region_id, [0.0, 0.0, 0])
+                entry[0] += x + w / 2.0
+                entry[1] += y + h / 2.0
+                entry[2] += 1
 
-            x, y, w, h = geom.section_to_pixel_rect(row, col, self.anchor, self.zoom)
-            entry = region_centroid_sum.setdefault(region_id, [0.0, 0.0, 0])
-            entry[0] += x + w / 2.0
-            entry[1] += y + h / 2.0
-            entry[2] += 1
+                fill_color = _STATUS_FILL_COLORS.get(self.region_status.get(region_id))
+                if fill_color is not None:
+                    painter.fillRect(QRectF(x, y, w, h), fill_color)
 
-            fill_color = _STATUS_FILL_COLORS.get(self.region_status.get(region_id))
-            if fill_color is not None:
-                painter.fillRect(QRectF(x, y, w, h), fill_color)
+                # Leave the interior transparent and only stroke the edges that border
+                # a different region (or empty space), so the outline traces the
+                # region's outer shape rather than every cell - the active region gets
+                # a thicker, distinctly-colored outline instead of any fill, so focus
+                # points already placed inside it stay easy to see.
+                is_active = region_id == self.active_region_id
+                pen = QPen(
+                    _ACTIVE_REGION_OUTLINE_COLOR if is_active else region_color(region_id),
+                    _ACTIVE_REGION_OUTLINE_WIDTH if is_active else _REGION_OUTLINE_WIDTH,
+                )
+                painter.setPen(pen)
+                for (dr, dc, x1, y1, x2, y2) in (
+                    (-1, 0, x, y, x + w, y),          # top
+                    (1, 0, x, y + h, x + w, y + h),   # bottom
+                    (0, -1, x, y, x, y + h),          # left
+                    (0, 1, x + w, y, x + w, y + h),   # right
+                ):
+                    if self.region_of.get((row + dr, col + dc)) != region_id:
+                        painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
-            # Leave the interior transparent and only stroke the edges that border
-            # a different region (or empty space), so the outline traces the
-            # region's outer shape rather than every cell - the active region gets
-            # a thicker, distinctly-colored outline instead of any fill, so focus
-            # points already placed inside it stay easy to see.
-            is_active = region_id == self.active_region_id
-            pen = QPen(
-                _ACTIVE_REGION_OUTLINE_COLOR if is_active else region_color(region_id),
-                _ACTIVE_REGION_OUTLINE_WIDTH if is_active else _REGION_OUTLINE_WIDTH,
-            )
-            painter.setPen(pen)
-            for (dr, dc, x1, y1, x2, y2) in (
-                (-1, 0, x, y, x + w, y),          # top
-                (1, 0, x, y + h, x + w, y + h),   # bottom
-                (0, -1, x, y, x, y + h),          # left
-                (0, 1, x + w, y, x + w, y + h),   # right
-            ):
-                if self.region_of.get((row + dr, col + dc)) != region_id:
-                    painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+            activity_color = _SECTION_ACTIVITY_COLORS.get(self.section_activity.get((row, col)))
+            if activity_color is not None:
+                painter.fillRect(QRectF(x, y, w, h), activity_color)
 
         for region_id, (sum_x, sum_y, count) in region_centroid_sum.items():
             self._draw_region_label(
@@ -486,12 +503,27 @@ class SectionCanvas(QGraphicsView):
         if self.mask_image is not None:
             self._redraw_mask()
 
+    def set_section_activity(self, row: int, col: int, activity: str | None):
+        """Live per-section scan/reconstruction overlay - see ControllerBridge's
+        sectionScanning/sectionReconstructing signals (wired in main_window.py).
+        activity is "scanning", "reconstructing", or None (idle/done)."""
+        key = (row, col)
+        if activity is None:
+            if key not in self.section_activity:
+                return
+            del self.section_activity[key]
+        else:
+            self.section_activity[key] = activity
+        if self.mask_image is not None:
+            self._redraw_mask()
+
     # ---- regions / focus points ----
     def apply_regions(self, region_of: dict[Section, int]):
         self.region_of = region_of
         self.draw_mode = False
         self.region_status = {}
         self.region_progress = {}
+        self.section_activity = {}
         self._hide_brush_cursor()
         self._redraw_mask()
 
@@ -503,6 +535,7 @@ class SectionCanvas(QGraphicsView):
         self.active_region_id = None
         self.region_status = {}
         self.region_progress = {}
+        self.section_activity = {}
         self.clear_focus_points()
         self._redraw_mask()
 
