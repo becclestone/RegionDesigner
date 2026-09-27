@@ -163,17 +163,24 @@ class RegionDesignerWindow(QMainWindow):
         next_region_btn.clicked.connect(lambda: self.region_id_spin.stepBy(1))
         toolbar.addWidget(next_region_btn)
 
-        toolbar.addWidget(QLabel(" AF Z start (initial guess): "))
+        # Second row: the autofocus/plane-fit/scan pipeline controls - kept on
+        # their own toolbar (via addToolBarBreak) rather than crammed onto the
+        # first row, which was getting too wide to fit on screen.
+        self.addToolBarBreak()
+        toolbar2 = QToolBar("Autofocus/Scan Pipeline", self)
+        self.addToolBar(toolbar2)
+
+        toolbar2.addWidget(QLabel(" AF Z start (initial guess): "))
         self.af_z_start_spin = QDoubleSpinBox()
         self.af_z_start_spin.setDecimals(4)
         self.af_z_start_spin.setRange(-10.0, 10.0)
         self.af_z_start_spin.setSingleStep(0.001)
         self.af_z_start_spin.setValue(_DEFAULT_AF_Z_START)
-        toolbar.addWidget(self.af_z_start_spin)
+        toolbar2.addWidget(self.af_z_start_spin)
 
         self.run_autofocus_btn = QPushButton("Run Autofocus for Region")
         self.run_autofocus_btn.clicked.connect(self._on_run_autofocus_clicked)
-        toolbar.addWidget(self.run_autofocus_btn)
+        toolbar2.addWidget(self.run_autofocus_btn)
 
         self.auto_run_autofocus_btn = QPushButton("Auto Run Autofocus for Region")
         self.auto_run_autofocus_btn.setToolTip(
@@ -181,7 +188,7 @@ class RegionDesignerWindow(QMainWindow):
             "(Auto Search, picking each point's highest-contrast capture) using the fitted peak as the starting Z."
         )
         self.auto_run_autofocus_btn.clicked.connect(self._on_auto_run_autofocus_clicked)
-        toolbar.addWidget(self.auto_run_autofocus_btn)
+        toolbar2.addWidget(self.auto_run_autofocus_btn)
 
         self.auto_finish_checkbox = QCheckBox("Auto-finish when confirmed")
         self.auto_finish_checkbox.setToolTip(
@@ -189,11 +196,11 @@ class RegionDesignerWindow(QMainWindow):
             "Unchecked: Auto Run stops there so you can do a final manual review before clicking "
             "'Done Reviewing This Region' yourself."
         )
-        toolbar.addWidget(self.auto_finish_checkbox)
+        toolbar2.addWidget(self.auto_finish_checkbox)
 
         self.fit_plane_btn = QPushButton("Fit Region Plane")
         self.fit_plane_btn.clicked.connect(self._on_fit_plane_clicked)
-        toolbar.addWidget(self.fit_plane_btn)
+        toolbar2.addWidget(self.fit_plane_btn)
 
         self.scan_region_btn = QPushButton("Scan Region")
         self.scan_region_btn.setToolTip(
@@ -205,9 +212,9 @@ class RegionDesignerWindow(QMainWindow):
             "perfectly capture the tissue's tilt/drift. See region_scan.py's module docstring."
         )
         self.scan_region_btn.clicked.connect(self._on_scan_region_clicked)
-        toolbar.addWidget(self.scan_region_btn)
+        toolbar2.addWidget(self.scan_region_btn)
 
-        toolbar.addSeparator()
+        toolbar2.addSeparator()
 
         self.auto_run_all_regions_btn = QPushButton("Auto Run All Regions")
         self.auto_run_all_regions_btn.setToolTip(
@@ -217,14 +224,14 @@ class RegionDesignerWindow(QMainWindow):
             "prompts once started. Use 'Stop After Current Region' to halt between regions."
         )
         self.auto_run_all_regions_btn.clicked.connect(self._on_auto_run_all_regions_clicked)
-        toolbar.addWidget(self.auto_run_all_regions_btn)
+        toolbar2.addWidget(self.auto_run_all_regions_btn)
 
         self.stop_auto_pipeline_btn = QPushButton("Stop After Current Region")
         self.stop_auto_pipeline_btn.setEnabled(False)
         self.stop_auto_pipeline_btn.clicked.connect(self._on_stop_auto_pipeline_clicked)
-        toolbar.addWidget(self.stop_auto_pipeline_btn)
+        toolbar2.addWidget(self.stop_auto_pipeline_btn)
 
-        toolbar.addSeparator()
+        toolbar2.addSeparator()
 
         self.start_aggregate_btn = QPushButton("Start New Aggregate Batch")
         self.start_aggregate_btn.setToolTip(
@@ -233,7 +240,7 @@ class RegionDesignerWindow(QMainWindow):
             "Region_N/Focus_M and Region_N/Scan_data. Nothing is archived until this is clicked."
         )
         self.start_aggregate_btn.clicked.connect(self._on_start_aggregate_clicked)
-        toolbar.addWidget(self.start_aggregate_btn)
+        toolbar2.addWidget(self.start_aggregate_btn)
 
     def _on_brush_radius_changed(self, value: int):
         self.canvas.brush_radius = value
