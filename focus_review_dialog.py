@@ -49,6 +49,9 @@ class FocusReviewDialog(QDialog):
         self.z_label = QLabel("")
         right.addWidget(self.z_label)
 
+        self.scan_z_label = QLabel("")
+        right.addWidget(self.scan_z_label)
+
         self.confirm_btn = QPushButton("Confirm via Scan (Z, Z-1µm, Z+1µm)")
         self.confirm_btn.clicked.connect(self._on_confirm_via_scan)
         right.addWidget(self.confirm_btn)
@@ -107,9 +110,17 @@ class FocusReviewDialog(QDialog):
 
         if z_opt is None:
             self.z_label.setText("No Z available")
+            self.scan_z_label.setText("")
         else:
             note = " (confirmed via scan)" if row in self.confirmed_z else " (algorithm pick, not yet confirmed)"
-            self.z_label.setText(f"Chosen Z = {z_opt:.4f}{note}")
+            self.z_label.setText(f"Chosen Z (focus peak) = {z_opt:.4f}{note}")
+            # The controller adds z_offset_correction on top of the given Z for every
+            # real scan move (not for the focus sweep itself) - see
+            # ProcessingTask.cpp's scan_position(), which is where the optical
+            # contrast-vs-sharpness shift this offset compensates for actually
+            # applies. This is what physically gets scanned, shown for reference only.
+            scan_z = z_opt + self.calibration.z_offset_correction
+            self.scan_z_label.setText(f"Actual scan Z (with z_offset) = {scan_z:.4f}")
             self.manual_z_spin.setValue(z_opt)
 
     def _clear_capture_row(self):

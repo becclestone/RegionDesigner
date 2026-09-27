@@ -10,6 +10,15 @@ _FILL_COLOR = QColor(255, 255, 255, 120)
 _BORDER_WIDTH = 2.0
 _BORDER_ALPHA = 150
 
+# Per-point focusing status, set from the main window as an AutofocusSequenceWorker
+# sweeps through a region's points, so progress is visible point-by-point rather
+# than only once the whole region's sequence finishes.
+_STATUS_FILL_COLORS = {
+    "focusing": QColor(255, 210, 40, 210),
+    "done": QColor(80, 230, 120, 210),
+    "failed": QColor(230, 70, 70, 210),
+}
+
 
 class FocusPointItem(QGraphicsEllipseItem):
     def __init__(self, region_id: int, row: int, col: int, canvas):
@@ -30,6 +39,10 @@ class FocusPointItem(QGraphicsEllipseItem):
         self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
 
         self._sync_position_from_section()
+
+    def set_status(self, status: str | None):
+        """status is None (pending), "focusing", "done", or "failed"."""
+        self.setBrush(QBrush(_STATUS_FILL_COLORS.get(status, _FILL_COLOR)))
 
     def section(self) -> tuple[float, float]:
         """Continuous (row, col) - not snapped to a grid cell. Use this for

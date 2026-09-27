@@ -64,6 +64,20 @@ _LABEL_BG_COLOR = QColor(0, 0, 0, 170)
 
 _GRID_LINE_COLOR = QColor(255, 255, 0, 70)
 
+# Focusing-progress overlay: keyed by SectionCanvas.region_status's values
+# ("focusing" / "confirmed" / "failed"), drawn on top of the region's normal
+# outline so progress is visible without opening the focus review dialog.
+_STATUS_FILL_COLORS = {
+    "focusing": QColor(255, 200, 0, 40),
+    "confirmed": QColor(60, 220, 90, 45),
+    "failed": QColor(230, 60, 60, 55),
+}
+_STATUS_LABEL_BG_COLORS = {
+    "focusing": QColor(200, 140, 0, 220),
+    "confirmed": QColor(30, 140, 60, 220),
+    "failed": QColor(180, 40, 40, 220),
+}
+
 
 class SectionCanvas(QGraphicsView):
     sectionsChanged = Signal()
@@ -95,6 +109,8 @@ class SectionCanvas(QGraphicsView):
         self.region_of: dict[Section, int] = {}
         self.draw_mode = True  # False once regions are compiled - brush is inactive until cleared
         self.active_region_id: int | None = None  # region currently being scanned - drawn highlighted
+        self.region_status: dict[int, str] = {}  # region_id -> "focusing" | "confirmed" | "failed"
+        self.region_progress: dict[int, tuple[int, int]] = {}  # region_id -> (points done, total)
         self.show_grid = False  # overlay of section-grid lines, toggled from the toolbar
 
         self.brush_radius = 4  # radius in section-width units (true circular radius in scene pixels)
@@ -332,6 +348,10 @@ class SectionCanvas(QGraphicsView):
             entry[1] += y + h / 2.0
             entry[2] += 1
 
+            fill_color = _STATUS_FILL_COLORS.get(self.region_status.get(region_id))
+            if fill_color is not None:
+                painter.fillRect(QRectF(x, y, w, h), fill_color)
+
             # Leave the interior transparent and only stroke the edges that border
             # a different region (or empty space), so the outline traces the
             # region's outer shape rather than every cell - the active region gets
@@ -353,7 +373,10 @@ class SectionCanvas(QGraphicsView):
                     painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
         for region_id, (sum_x, sum_y, count) in region_centroid_sum.items():
-            self._draw_region_label(painter, region_id, sum_x / count, sum_y / count)
+            self._draw_region_label(
+                painter, region_id, sum_x / count, sum_y / count,
+                self.region_status.get(region_id), self.region_progress.get(region_id),
+            )
 
         painter.end()
         self.mask_item.setPixmap(QPixmap.fromImage(self.mask_image))
@@ -392,11 +415,25 @@ class SectionCanvas(QGraphicsView):
         if self.mask_image is not None:
             self._redraw_mask()
 
-    def _draw_region_label(self, painter: QPainter, region_id: int, cx: float, cy: float):
+    def _draw_region_label(
+        self, painter: QPainter, region_id: int, cx: float, cy: float,
+        status: str | None = None, progress: tuple[int, int] | None = None,
+    ):
         """Draws the region's scan-order number (its region_id, which clustering
         already assigns in serpentine scan order) at the region's centroid, so the
-        operator can read the intended scan order straight off the canvas."""
-        text = str(region_id)
+        operator can read the intended scan order straight off the canvas. When a
+        focusing run has touched this region, the label also reports progress
+        ("running autofocus" -> "n/total", then a confirmed/failed mark) and its
+        background is tinted to match, so status is visible without opening the
+        focus review dialog."""
+        if status == "focusing" and progress is not None:
+            text = f"{region_id} ({progress[0]}/{progress[1]})"
+        elif status == "confirmed":
+            text = f"{region_id} ✓"
+        elif status == "failed":
+            text = f"{region_id} ✗"
+        else:
+            text = str(region_id)
         font = QFont()
         font.setPointSizeF(12.0)
         font.setBold(True)
@@ -409,7 +446,7 @@ class SectionCanvas(QGraphicsView):
             text_rect.width() + padding * 2, text_rect.height() + padding * 2,
         )
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(_LABEL_BG_COLOR)
+        painter.setBrush(_STATUS_LABEL_BG_COLORS.get(status, _LABEL_BG_COLOR))
         painter.drawRoundedRect(bg_rect, 3, 3)
         painter.setPen(_LABEL_TEXT_COLOR)
         painter.drawText(bg_rect, Qt.AlignmentFlag.AlignCenter, text)
@@ -423,10 +460,28 @@ class SectionCanvas(QGraphicsView):
         if self.mask_image is not None:
             self._redraw_mask()
 
+    def set_region_status(self, region_id: int, status: str | None):
+        """Marks a region's focusing progress state ("focusing"/"confirmed"/
+        "failed", or None to go back to unmarked/pending) - see _draw_region_label
+        and the fill overlay in _redraw_mask for how this is drawn."""
+        if status is None:
+            self.region_status.pop(region_id, None)
+        else:
+            self.region_status[region_id] = status
+        if self.mask_image is not None:
+            self._redraw_mask()
+
+    def set_region_progress(self, region_id: int, done: int, total: int):
+        self.region_progress[region_id] = (done, total)
+        if self.mask_image is not None:
+            self._redraw_mask()
+
     # ---- regions / focus points ----
     def apply_regions(self, region_of: dict[Section, int]):
         self.region_of = region_of
         self.draw_mode = False
+        self.region_status = {}
+        self.region_progress = {}
         self._hide_brush_cursor()
         self._redraw_mask()
 
@@ -436,6 +491,8 @@ class SectionCanvas(QGraphicsView):
         self.region_of = {}
         self.draw_mode = True
         self.active_region_id = None
+        self.region_status = {}
+        self.region_progress = {}
         self.clear_focus_points()
         self._redraw_mask()
 

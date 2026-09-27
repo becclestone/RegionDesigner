@@ -26,8 +26,12 @@ _MICRON_MM = 0.001
 # run folder can exist (and its NR subfolder be empty) for a while before the file
 # actually lands. Poll for the file itself rather than failing the moment the
 # folder appears.
-_IMAGE_APPEAR_TIMEOUT_S = 30.0
+_IMAGE_APPEAR_TIMEOUT_S = 60.0
 _IMAGE_APPEAR_POLL_INTERVAL_S = 1.0
+
+# Give other processes that still hold the file open (writer flush, AV scan, etc.)
+# a moment to release it before we try to read it ourselves.
+_IMAGE_SETTLE_DELAY_S = 3.0
 
 
 @dataclass
@@ -43,7 +47,7 @@ def _list_run_folders() -> set:
     return {name for name in os.listdir(IMAGES_ROOT) if os.path.isdir(os.path.join(IMAGES_ROOT, name))}
 
 
-def _wait_for_new_run_folder(existing: set, timeout: float = 30.0, poll_interval: float = 0.5) -> str:
+def _wait_for_new_run_folder(existing: set, timeout: float = 60.0, poll_interval: float = 0.5) -> str:
     """Each scan run gets its own timestamped folder (verified against a real scan
     example), so the run just triggered is whichever folder wasn't there before."""
     deadline = time.time() + timeout
@@ -71,6 +75,7 @@ def _wait_for_file(path: str, timeout: float = _IMAGE_APPEAR_TIMEOUT_S,
 def score_nr_image(run_folder: str, row: int, col: int) -> tuple:
     image_path = os.path.join(run_folder, "NR", f"s-{row}-{col}_nr_float32.tif")
     _wait_for_file(image_path)
+    time.sleep(_IMAGE_SETTLE_DELAY_S)
     image = tifffile.imread(image_path)
     return image_path, float(np.percentile(image, 99))
 

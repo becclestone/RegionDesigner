@@ -51,6 +51,8 @@ class RegionDesignerWindow(QMainWindow):
         self.region_focus_points: dict[int, list[tuple[float, float, float]]] = {}  # region_id -> [(row,col,z)]
         self.section_z: dict[tuple[int, int], float] = {}
         self._af_worker = None
+        self._af_region_id: int | None = None
+        self._af_region_items: list = []
 
         self._build_toolbar()
         self.status_label = QLabel("No calibration loaded.")
@@ -231,23 +233,45 @@ class RegionDesignerWindow(QMainWindow):
             QMessageBox.information(self, "Run Autofocus", f"No focus points found for region {region_id}.")
             return
 
+        # focus_points_by_region() iterates canvas.focus_point_items in the same
+        # order it builds `points` in, so this list lines up index-for-index with
+        # the worker's pointStarted/pointFitted/pointFailed indices.
+        region_items = [item for item in self.canvas.focus_point_items if item.region_id == region_id]
+        for item in region_items:
+            item.set_status(None)
+
         self.run_autofocus_btn.setEnabled(False)
         self.status_label.setText(f"Running autofocus for region {region_id}: 0/{len(points)}")
+        self.canvas.set_region_status(region_id, "focusing")
+        self.canvas.set_region_progress(region_id, 0, len(points))
 
         worker = AutofocusSequenceWorker(
             self.bridge, self.calibration, points,
             z_start=self.af_z_start_spin.value(),
         )
         worker.pointStarted.connect(self._on_autofocus_point_started)
+        worker.pointFitted.connect(self._on_autofocus_point_fitted)
         worker.pointFailed.connect(self._on_autofocus_point_failed)
         worker.sequenceFinished.connect(lambda: self._on_autofocus_sequence_finished(region_id, worker))
+        self._af_region_id = region_id
+        self._af_region_items = region_items
         self._af_worker = worker  # keep alive for the duration of the sequence
         worker.start()
 
     def _on_autofocus_point_started(self, index: int, total: int):
         self.status_label.setText(f"Running autofocus: point {index + 1}/{total}")
+        if index < len(self._af_region_items):
+            self._af_region_items[index].set_status("focusing")
+        self.canvas.set_region_progress(self._af_region_id, index, total)
+
+    def _on_autofocus_point_fitted(self, index: int, fit):
+        if index < len(self._af_region_items):
+            self._af_region_items[index].set_status("done")
+        self.canvas.set_region_progress(self._af_region_id, index + 1, len(self._af_region_items))
 
     def _on_autofocus_point_failed(self, index: int, message: str):
+        if index < len(self._af_region_items):
+            self._af_region_items[index].set_status("failed")
         QMessageBox.warning(self, "Autofocus failed", f"Point {index}: {message}")
 
     def _on_autofocus_sequence_finished(self, region_id: int, worker: AutofocusSequenceWorker):
@@ -255,6 +279,7 @@ class RegionDesignerWindow(QMainWindow):
         self.status_label.setText(f"Autofocus done for region {region_id}: {len(worker.fits)} point(s) fitted.")
 
         if not worker.fits:
+            self.canvas.set_region_status(region_id, "failed")
             return
 
         dialog = FocusReviewDialog(self.bridge, self.calibration, region_id, worker.fits, parent=self)
@@ -263,6 +288,10 @@ class RegionDesignerWindow(QMainWindow):
             self.status_label.setText(
                 f"Region {region_id}: {len(self.region_focus_points[region_id])} focus point(s) confirmed."
             )
+            self.canvas.set_region_status(region_id, "confirmed")
+        else:
+            # Operator declined the fit - go back to unmarked/pending so a retry is unambiguous.
+            self.canvas.set_region_status(region_id, None)
 
     def _on_fit_plane_clicked(self):
         region_id = self.region_id_spin.value()

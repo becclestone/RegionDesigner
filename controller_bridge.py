@@ -33,6 +33,20 @@ from Utilities.controller_commands import move_to_snap_position
 _DEFAULT_AUTOFOCUS_TIMEOUT_S = 60.0
 _DEFAULT_SCAN_TIMEOUT_S = 120.0
 
+# MEMS (scanning-mirror) sine-drive defaults - DOVER_UI/Windows/main_window.py:349-362,
+# same values as DOVER_UI/Windows/main_window_layouts.py's cX_AMPLITUDE_RESET etc. The
+# controller (dover_ctl2/src/MsgHandler.cpp:1166-1192) applies these directly to the
+# galvo/mirror driver and gates real scans on this having been sent at least once
+# (mems_profile_loaded); DOVER_UI sends it automatically on cDISCOVER_MEMS reply.
+# RegionDesigner has no discover-MEMS flow, so this is pushed directly instead.
+_MEMS_Y_VOLTAGE = 0.0
+_MEMS_X_AMPLITUDE = 0.78
+_MEMS_X_FREQUENCY = 2265
+_MEMS_SAMPLING_RATE = 20000
+_MEMS_SAMPLE_POINTS = 20000
+_MEMS_V_DIFFERENCE = 25
+_MEMS_CUTOFF = 2750
+
 
 def _drain(q: Queue) -> None:
     """Discards any stale reply left behind by a previous timed-out call, so the
@@ -79,6 +93,8 @@ class ControllerBridge(QObject):
         self._listener_thread = Thread(target=self._dispatch_loop, daemon=True)
         self._listener_thread.start()
 
+        self.send_mems_run_profile()
+
     def _dispatch_loop(self):
         while self._running:
             try:
@@ -102,6 +118,32 @@ class ControllerBridge(QObject):
             self._path_reply_queue.put(("ack", msg.get_msg_payload()))
         elif msg_type == src.cREPLY_MSG and msg.get_msg_reply_type() == ic.cSET_ANCHOR_POINT_MSG:
             self._anchor_reply_queue.put(msg.get_msg_payload())
+
+    def send_mems_run_profile(self) -> None:
+        """Fire-and-forget, mirrors DOVER_UI/Windows/main_window.py:889-894
+        (send_mems_run_profile). Programs the scanning-mirror sine driver on the
+        controller and marks mems_profile_loaded there; without this, a real scan
+        either rides on whatever profile a previously-run DOVER_UI instance left
+        behind, or is rejected outright (cMEMS_PROFILE_NOT_LOADED) on a fresh
+        controller process. No reply is defined for this message on the controller
+        side, so this doesn't block waiting for one."""
+        payload = {
+            ic.cTAB_SENDER: "region_designer",
+            ic.cENABLE_DIGITAL_OUT: False,
+            ic.cX_SIGNAL_FORM: True,  # sine, not DC
+            ic.cY_VOLTAGE: _MEMS_Y_VOLTAGE,
+            ic.cX_AMPLITUDE: _MEMS_X_AMPLITUDE,
+            ic.cX_FREQUENCY: _MEMS_X_FREQUENCY,
+            ic.cCUTOFF: _MEMS_CUTOFF,
+            ic.cV_DIFFERENCE: _MEMS_V_DIFFERENCE,
+            ic.cSAMPLING_RATE: _MEMS_SAMPLING_RATE,
+            ic.cSAMPLE_POINTS: _MEMS_SAMPLE_POINTS,
+            ic.cRED_LASER_ON: False,
+            ic.cZ_POSITION: 0.0,
+        }
+        cmd = TIsMsg.create_cmd_msg(ic.cSET_MEMS_RUN_PROFILE_MSG, ic.CTL_TARGET)
+        cmd.add_msg_payload(payload)
+        cmd.send_q_destroy()
 
     def request_snap(self):
         """Mirrors DOVER_UI/Windows/demo_control_a.py's Snap button sequence exactly."""
