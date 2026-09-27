@@ -366,13 +366,18 @@ cTEMP_SENSOR_5 = "!ts5"
 cTEMP_SENSOR_6 = "!ts6"
 cTEMP_SENSOR_7 = "!ts7"
 #
-# recon messages to UI - broadcast once per reconstruction batch (not per
-# section - no row/col identifies which section(s) it covers), no payload.
-# Verified against dover_ctl2/include/Config/implementation_constants.h, whose
-# values ("-rON"/"-rOFF") this previously didn't match at all (this repo's old
-# "!ron"/"!roff" never matched anything the controller actually sends).
-cRECON_ON_MSG = "-rON"
-cRECON_OFF_MSG = "-rOFF"
+# recon messages to UI - fires once per SECTION (row/col payload, reusing
+# cSECTION_ROW/cSECTION_COL below), confirmed against DOVER_UI's own live,
+# working demo_control_a.py (update_recon_progress reads
+# values[ic.cSECTION_ROW]/[ic.cSECTION_COL] off this exact message). Earlier
+# this session these were mistakenly "corrected" to dover_ctl2's dead
+# cRECONSTRUCTION_ON/OFF ("-rON"/"-rOFF", no payload, never actually sent by
+# the running system) - reverted back to the values DOVER_UI actually uses.
+cRECON_ON_MSG = "!ron"
+cRECON_OFF_MSG = "!roff"
+# payload is reusing constants
+# cSECTION_ROW = "$sr"
+# cSECTION_COL = "$sc"
 #
 # replay payload fields
 # error fields below are common and defined in shared_rmq_constants

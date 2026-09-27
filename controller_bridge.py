@@ -12,7 +12,7 @@ thread, so no extra locking is needed here.
 import json
 from queue import Queue, Empty
 from threading import Thread
-from time import sleep
+from time import monotonic, sleep
 
 from PySide6.QtCore import QObject, Signal
 
@@ -69,10 +69,7 @@ class ControllerBridge(QObject):
     # cPATH_UPDATE_MSG (see run_path_scan's docstring), these fire once per
     # section, independent of whether the path itself is open- or closed-loop.
     sectionScanning = Signal(int, int, bool)        # master_row, master_col, is_scanning
-    # Fires once per reconstruction batch finishing - no row/col (the controller's
-    # cRECON_OFF_MSG broadcast carries no payload at all, unlike cPATH_SCAN_ON/OFF_MSG
-    # above), so this can't say which section(s) it covers. See wait_for_reconstruction_off.
-    reconstructionFinished = Signal()
+    sectionReconstructing = Signal(int, int, bool)  # master_row, master_col, is_reconstructing
 
     def __init__(self):
         super().__init__()
@@ -131,9 +128,13 @@ class ControllerBridge(QObject):
             self.sectionScanning.emit(
                 payload[ic.cSECTION_ROW], payload[ic.cSECTION_COL], msg_type == ic.cPATH_SCAN_ON_MSG
             )
-        elif msg_type == ic.cRECON_OFF_MSG:
-            self._reconstruction_reply_queue.put(None)
-            self.reconstructionFinished.emit()
+        elif msg_type in (ic.cRECON_ON_MSG, ic.cRECON_OFF_MSG):
+            payload = msg.get_msg_payload()
+            row, col = payload[ic.cSECTION_ROW], payload[ic.cSECTION_COL]
+            is_on = msg_type == ic.cRECON_ON_MSG
+            self.sectionReconstructing.emit(row, col, is_on)
+            if not is_on:
+                self._reconstruction_reply_queue.put((row, col))
         elif msg_type == src.cREPLY_MSG and msg.get_msg_reply_type() == ic.cPATH_MSG:
             self._path_reply_queue.put(("ack", msg.get_msg_payload()))
         elif msg_type == src.cREPLY_MSG and msg.get_msg_reply_type() == ic.cSET_ANCHOR_POINT_MSG:
@@ -174,19 +175,25 @@ class ControllerBridge(QObject):
     def is_busy(self) -> bool:
         return self._busy
 
-    def wait_for_reconstruction_off(self, timeout: float) -> bool:
-        """Blocks up to timeout for the controller's next reconstruction-off
-        broadcast. Returns True if one arrived, False on timeout - callers (see
-        confirmation_scan.py's _wait_for_image) should treat False as "keep
-        polling for the file directly" rather than an error, since this
-        message's exact correlation to any one capture isn't guaranteed by the
-        protocol (it's a per-batch, not per-section, broadcast - see
-        reconstructionFinished's docstring)."""
-        try:
-            self._reconstruction_reply_queue.get(timeout=timeout)
-            return True
-        except Empty:
-            return False
+    def wait_for_reconstruction_off(self, row: int, col: int, timeout: float) -> bool:
+        """Blocks up to timeout for the controller's reconstruction-off
+        broadcast for this specific (row, col) section. Returns True if it
+        arrived, False on timeout - callers (see confirmation_scan.py's
+        _wait_for_image) should treat False as "keep polling for the file
+        directly" rather than an error. A reconstruction-off for some other
+        section (e.g. a late arrival left over from a previous call) is
+        discarded rather than satisfying this wait."""
+        deadline = monotonic() + timeout
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                got_row, got_col = self._reconstruction_reply_queue.get(timeout=remaining)
+            except Empty:
+                return False
+            if (got_row, got_col) == (row, col):
+                return True
 
     def run_autofocus(self, row: int, col: int, z_start: float, z_step: float, num_layers: int,
                        timeout: float = _DEFAULT_AUTOFOCUS_TIMEOUT_S) -> list:

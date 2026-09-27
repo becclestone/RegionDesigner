@@ -28,12 +28,10 @@ MICRON_MM = 0.001  # public: focus_review_dialog uses this to step the "add a po
 # itself reports cPATH_UPDATE_MSG complete - observed delay is up to ~20s, so the
 # run folder can exist (and its NR subfolder be empty) for a while before the file
 # actually lands. _wait_for_image below is driven primarily by the controller's
-# own reconstruction-off broadcast (ControllerBridge.wait_for_reconstruction_off),
-# which is far faster than polling - but that message is a per-batch, not
-# per-section, broadcast (see its docstring), so its correlation to any one
-# capture isn't formally guaranteed; keep polling for the file itself on every
-# interval too; whichever notices the file first wins, so a missed/misattributed
-# message can never cause an indefinite hang.
+# own per-section reconstruction-off broadcast (see
+# ControllerBridge.wait_for_reconstruction_off), which is far faster than
+# polling - but also keeps polling for the file itself on every interval as a
+# backstop, so a missed message can never cause an indefinite hang.
 _IMAGE_APPEAR_TIMEOUT_S = 60.0
 _IMAGE_APPEAR_POLL_INTERVAL_S = 1.0
 
@@ -69,12 +67,12 @@ def _wait_for_new_run_folder(existing: set, timeout: float = 60.0, poll_interval
     raise TimeoutError("Scan completed but no new output folder appeared under IMAGES_ROOT.")
 
 
-def _wait_for_image(bridge, path: str, timeout: float = _IMAGE_APPEAR_TIMEOUT_S,
+def _wait_for_image(bridge, row: int, col: int, path: str, timeout: float = _IMAGE_APPEAR_TIMEOUT_S,
                      poll_interval: float = _IMAGE_APPEAR_POLL_INTERVAL_S) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         remaining = deadline - time.time()
-        if bridge.wait_for_reconstruction_off(min(poll_interval, max(remaining, 0.0))) and os.path.isfile(path):
+        if bridge.wait_for_reconstruction_off(row, col, min(poll_interval, max(remaining, 0.0))):
             return
         if os.path.isfile(path):
             return
@@ -86,7 +84,7 @@ def _wait_for_image(bridge, path: str, timeout: float = _IMAGE_APPEAR_TIMEOUT_S,
 
 def score_nr_image(bridge, run_folder: str, row: int, col: int) -> tuple:
     image_path = os.path.join(run_folder, "NR", f"s-{row}-{col}_nr_float32.tif")
-    _wait_for_image(bridge, image_path)
+    _wait_for_image(bridge, row, col, image_path)
     time.sleep(_IMAGE_SETTLE_DELAY_S)
     image = tifffile.imread(image_path)
     return image_path, float(np.percentile(image, 99))

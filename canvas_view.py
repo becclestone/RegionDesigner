@@ -85,20 +85,17 @@ _STATUS_LABEL_BG_COLORS = {
 
 # Live per-section scan/reconstruction overlay (see SectionCanvas.section_activity
 # and set_section_activity) - drawn per painted section, on top of the coarser
-# region-level tint above. ControllerBridge's sectionScanning signal reports
-# individual sections starting/finishing scanning; reconstructionFinished is a
-# per-batch (not per-section) broadcast, so main_window.py attributes each one to
-# the oldest section still awaiting it (see its _pending_reconstruction FIFO).
+# region-level tint above, as ControllerBridge's sectionScanning/
+# sectionReconstructing signals report individual sections starting/finishing.
 # Mirrors DOVER_UI's own colored-box scan/recon overlay (demo_control_a.py):
 # solid gold/red there since it draws opaque PNG tiles, translucent here since
 # this canvas fills directly over the section's normal appearance instead of
 # replacing it.
 # "reconstructed" is a persistent marker (not just an instant): main_window.py
-# sets it once a reconstruction-off broadcast is attributed to this section,
-# instead of clearing back to no overlay, so a completed section stays visibly
-# distinct from one still awaiting reconstruction - a darker/desaturated green
-# vs. "reconstructing"'s brighter one, so the two are easy to tell apart at a
-# glance.
+# sets it once a section's cRECON_OFF_MSG arrives, instead of clearing back to
+# no overlay, so a completed section stays visibly distinct from one still
+# awaiting reconstruction - a darker/desaturated green vs. "reconstructing"'s
+# brighter one, so the two are easy to tell apart at a glance.
 _SECTION_ACTIVITY_COLORS = {
     "scanning": QColor(255, 220, 0, 130),
     "reconstructing": QColor(60, 220, 90, 130),
@@ -514,9 +511,9 @@ class SectionCanvas(QGraphicsView):
 
     def set_section_activity(self, row: int, col: int, activity: str | None):
         """Live per-section scan/reconstruction overlay - see ControllerBridge's
-        sectionScanning/reconstructionFinished signals (wired in main_window.py).
+        sectionScanning/sectionReconstructing signals (wired in main_window.py).
         activity is "scanning", "reconstructing", "reconstructed" (a persistent
-        done marker - see main_window._on_reconstruction_finished), or None
+        done marker - see main_window._on_section_reconstructing), or None
         (idle, no marker)."""
         key = (row, col)
         if activity is None:

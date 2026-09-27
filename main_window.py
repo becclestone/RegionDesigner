@@ -1,6 +1,7 @@
 import glob
 import os
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QMainWindow, QToolBar, QSpinBox, QDoubleSpinBox, QPushButton, QLabel, QMessageBox, QFileDialog, QCheckBox
 )
@@ -19,6 +20,15 @@ from region_scan import RegionScanWorker
 _DEFAULT_TARGET_REGION_SIZE = 100
 _DEFAULT_FOCUS_POINTS_PER_REGION = 4
 _DEFAULT_AF_Z_START = -0.010
+# Per-section budget for how long a region scan's archive-to-aggregate-batch
+# move waits for reconstruction-off before archiving anyway (see
+# _force_finish_scan_archive) - matches confirmation_scan.py's documented ~20s
+# observed reconstruction lag per section, scaled by the section count of the
+# scan in question (see _on_region_scan_finished) rather than one flat timeout,
+# since a large region's reconstruction backlog is proportionally longer than a
+# small one's.
+_RECON_TIMEOUT_PER_SECTION_S = 20.0
+_MIN_SCAN_ARCHIVE_TIMEOUT_MS = 60 * 1000  # floor for very small (e.g. 1-section) scans
 
 # DOVER_UI is a sibling checkout that already carries the operator's calibration
 # (Stage Calibration tab, saved to its saved-calibration/ folder). Auto-loading its
@@ -50,7 +60,7 @@ class RegionDesignerWindow(QMainWindow):
         self.bridge.imageReady.connect(self._on_image_ready)
         self.bridge.commandError.connect(self._on_command_error)
         self.bridge.sectionScanning.connect(self._on_section_scanning)
-        self.bridge.reconstructionFinished.connect(self._on_reconstruction_finished)
+        self.bridge.sectionReconstructing.connect(self._on_section_reconstructing)
 
         self.calibration: StageCalibration | None = None
         self.region_focus_points: dict[int, list[tuple[float, float, float]]] = {}  # region_id -> [(row,col,z)]
@@ -62,13 +72,16 @@ class RegionDesignerWindow(QMainWindow):
         self._scan_worker = None
         self._scanning_region_id: int | None = None
         self._scan_existing_run_folders: set[str] = set()
-        # Sections that finished physical scanning but have no confirmed
-        # reconstruction-complete event yet, oldest first - see
-        # _on_reconstruction_finished (the controller's reconstruction-off
-        # broadcast carries no row/col, so this FIFO is how each broadcast gets
-        # attributed back to a specific section for the canvas overlay).
-        self._pending_reconstruction: list[tuple[int, int]] = []
         self._aggregate_root: str | None = None
+        # One entry per region scan whose output is still being archived (or is
+        # eligible to be, once its aggregate batch is known) - see
+        # _start_region_scan/_on_region_scan_finished/_on_section_reconstructing/
+        # _maybe_archive_tracker. More than one can be in flight at once, since
+        # reconstruction for one region's last sections can still be catching up
+        # (see run_path_scan's docstring) after the next region's scan has
+        # already started.
+        self._scan_recon_trackers: list[dict] = []
+        self._active_scan_tracker: dict | None = None
 
         # "Auto Run All Regions": autofocus -> confirm -> fit plane -> scan,
         # then advance to the next region, repeated unattended for every region
@@ -258,25 +271,22 @@ class RegionDesignerWindow(QMainWindow):
         QMessageBox.warning(self, "Controller error", message)
 
     def _on_section_scanning(self, master_row: int, master_col: int, active: bool):
-        if active:
-            self._set_section_activity(master_row, master_col, "scanning")
-        else:
-            # Scanning's done for this section, but the controller's own
-            # reconstruction-off broadcast (_on_reconstruction_finished) has no
-            # row/col - it's a per-batch, not per-section, event. Sections are
-            # reconstructed in the order they finish scanning, so track them
-            # FIFO and resolve the oldest pending one each time reconstruction-
-            # off fires - a persistent "reconstructed" marker (a different,
-            # darker color - see canvas_view._SECTION_ACTIVITY_COLORS) rather
-            # than clearing back to no overlay, so completed sections stay
-            # visibly distinguishable as reconstruction works through the rest.
-            self._set_section_activity(master_row, master_col, "reconstructing")
-            self._pending_reconstruction.append((master_row, master_col))
+        self._set_section_activity(master_row, master_col, "scanning" if active else None)
 
-    def _on_reconstruction_finished(self):
-        if self._pending_reconstruction:
-            master_row, master_col = self._pending_reconstruction.pop(0)
-            self._set_section_activity(master_row, master_col, "reconstructed")
+    def _on_section_reconstructing(self, master_row: int, master_col: int, active: bool):
+        # Unlike scanning, recon-off leaves a persistent "reconstructed" marker
+        # (a different, darker color - see canvas_view._SECTION_ACTIVITY_COLORS)
+        # rather than clearing back to no overlay, so completed sections stay
+        # visibly distinguishable as reconstruction works through the rest.
+        self._set_section_activity(master_row, master_col, "reconstructing" if active else "reconstructed")
+        if active:
+            return
+        section = (master_row, master_col)
+        for tracker in self._scan_recon_trackers:
+            if section in tracker["remaining"]:
+                tracker["remaining"].discard(section)
+                if tracker["ready"]:
+                    self._maybe_archive_tracker(tracker)
 
     def _set_section_activity(self, master_row: int, master_col: int, activity: str | None):
         """master_row/master_col are master-grid (absolute) coordinates, as the
@@ -545,6 +555,22 @@ class RegionDesignerWindow(QMainWindow):
         # just an os.listdir), so _on_region_scan_finished can diff it either way.
         self._scan_existing_run_folders = confirmation_scan.list_run_folders()
 
+        # Tracked from scan start (not scan finish) - reconstruction for early
+        # sections in the path can complete well before the whole path does, and
+        # this must catch those too, or the tracker would wait forever for
+        # reconstruction-off events that already happened. Same master-grid
+        # offset RegionScanWorker itself applies internally.
+        master_sections = {
+            (int(round(self.calibration.offset_row + row)), int(round(self.calibration.offset_col + col)))
+            for row, col, _z in sections_with_z
+        }
+        tracker = {
+            "region_id": region_id, "remaining": set(master_sections), "folders": None, "ready": False,
+            "total_sections": len(master_sections),
+        }
+        self._scan_recon_trackers.append(tracker)
+        self._active_scan_tracker = tracker
+
         worker = RegionScanWorker(self.bridge, self.calibration, sections_with_z)
         worker.scanFailed.connect(self._on_region_scan_failed)
         worker.scanFinished.connect(self._on_region_scan_finished)
@@ -557,16 +583,59 @@ class RegionDesignerWindow(QMainWindow):
         self._set_hardware_controls_enabled(True)
         self.status_label.setText(f"Region {region_id}: scan complete.")
         self.canvas.set_region_status(region_id, "scanned")
-        if self._aggregate_root is not None:
-            new_folder_names = confirmation_scan.list_run_folders() - self._scan_existing_run_folders
-            new_run_folders = {
-                os.path.join(confirmation_scan.IMAGES_ROOT, name) for name in new_folder_names
-            }
-            if new_run_folders:
-                scan_archive.archive_region_scan(self._aggregate_root, region_id, new_run_folders)
         self._scanning_region_id = None
+
+        tracker = self._active_scan_tracker
+        self._active_scan_tracker = None
+        if tracker is not None:
+            if self._aggregate_root is not None:
+                new_folder_names = confirmation_scan.list_run_folders() - self._scan_existing_run_folders
+                new_run_folders = {
+                    os.path.join(confirmation_scan.IMAGES_ROOT, name) for name in new_folder_names
+                }
+                if new_run_folders:
+                    # Not moved yet - only once every section in tracker["remaining"]
+                    # has reported reconstruction-off (see _on_section_reconstructing/
+                    # _maybe_archive_tracker), so a section still being reconstructed
+                    # when the path itself completes can't have its run folder moved
+                    # out from under the writer still finishing it.
+                    tracker["folders"] = new_run_folders
+                    tracker["ready"] = True
+                    timeout_ms = max(
+                        int(_RECON_TIMEOUT_PER_SECTION_S * tracker["total_sections"] * 1000),
+                        _MIN_SCAN_ARCHIVE_TIMEOUT_MS,
+                    )
+                    QTimer.singleShot(timeout_ms, lambda t=tracker: self._force_finish_scan_archive(t))
+                    self._maybe_archive_tracker(tracker)
+                else:
+                    self._scan_recon_trackers.remove(tracker)
+            else:
+                self._scan_recon_trackers.remove(tracker)  # no aggregate active - nothing to archive
+
         if self._auto_pipeline_active:
             self._advance_auto_pipeline()
+
+    def _maybe_archive_tracker(self, tracker: dict):
+        if not tracker["ready"] or tracker["remaining"]:
+            return  # scan not finished yet, or some section(s) still reconstructing
+        scan_archive.archive_region_scan(self._aggregate_root, tracker["region_id"], tracker["folders"])
+        if tracker in self._scan_recon_trackers:
+            self._scan_recon_trackers.remove(tracker)
+
+    def _force_finish_scan_archive(self, tracker: dict):
+        """Safety net: archives anyway after _SCAN_ARCHIVE_TIMEOUT_MS even if some
+        section(s) never reported reconstruction-off (a dropped message, say),
+        so an aggregate batch can't get stuck waiting forever - but only ever
+        fires after the normal wait already had a generous window to resolve."""
+        if tracker not in self._scan_recon_trackers or not tracker["ready"]:
+            return  # already archived
+        if tracker["remaining"]:
+            self.status_label.setText(
+                f"Region {tracker['region_id']}: archiving scan data after timeout - "
+                f"{len(tracker['remaining'])} section(s) never reported reconstruction complete."
+            )
+            tracker["remaining"].clear()
+        self._maybe_archive_tracker(tracker)
 
     def _on_region_scan_failed(self, message: str):
         region_id = self._scanning_region_id
@@ -574,6 +643,10 @@ class RegionDesignerWindow(QMainWindow):
         self.status_label.setText(f"Region {region_id}: scan failed.")
         self.canvas.set_region_status(region_id, "failed")
         self._scanning_region_id = None
+        tracker = self._active_scan_tracker
+        self._active_scan_tracker = None
+        if tracker is not None and tracker in self._scan_recon_trackers:
+            self._scan_recon_trackers.remove(tracker)  # scan failed - nothing to archive
         if self._auto_pipeline_active:
             self._end_auto_pipeline(
                 f"Auto Run All Regions: stopped - region {region_id} scan failed.",
