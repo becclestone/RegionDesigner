@@ -148,6 +148,29 @@ class SectionCanvas(QGraphicsView):
         self.focus_point_items: list[FocusPointItem] = []
 
     # ---- background image ----
+    def reset(self):
+        """Clears everything back to a blank canvas - no background image, no
+        painted sections, no regions, no focus points - so a brand new scan
+        starts from the same state the app does on launch. See main_window's
+        Reset button."""
+        if self.background_item is not None:
+            self._scene.removeItem(self.background_item)
+            self.background_item = None
+        if self.mask_item is not None:
+            self._scene.removeItem(self.mask_item)
+            self.mask_item = None
+        self.mask_image = None
+        self._hide_brush_cursor()
+
+        self.painted = set()
+        self.region_of = {}
+        self.draw_mode = True
+        self.active_region_id = None
+        self.region_status = {}
+        self.region_progress = {}
+        self.section_activity = {}
+        self.clear_focus_points()
+
     def set_background_image(self, path: str):
         pixmap = _pil_to_qpixmap(_load_registered_image(path))
         if self.background_item is not None:

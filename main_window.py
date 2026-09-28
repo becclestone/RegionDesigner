@@ -13,6 +13,7 @@ import confirmation_scan
 import autofocus_log
 import region_clustering as clustering
 import scan_archive
+import scan_finalize
 from stage_calibration import StageCalibration
 from autofocus_client import AutofocusSequenceWorker
 from focus_review_dialog import FocusReviewDialog
@@ -258,6 +259,26 @@ class RegionDesignerWindow(QMainWindow):
 
         toolbar2.addSeparator()
 
+        self.reset_btn = QPushButton("Reset for New Scan")
+        self.reset_btn.setToolTip(
+            "Clears the canvas (background image, painted sections, regions, focus points), all "
+            "plane-fit Z values, and forgets the current aggregate batch, so a brand new sample can be "
+            "started from scratch. Nothing already written to disk is deleted or affected."
+        )
+        self.reset_btn.clicked.connect(self._on_reset_clicked)
+        toolbar2.addWidget(self.reset_btn)
+
+        self.open_previous_scan_btn = QPushButton("Open Previous Scan...")
+        self.open_previous_scan_btn.setToolTip(
+            "Picks an existing <timestamp>_aggregate folder under IMAGES_ROOT and makes it the active "
+            "aggregate batch again, so further scanning/archiving or Finalize Results can resume "
+            "targeting it. Does not restore the canvas's painted regions/focus points."
+        )
+        self.open_previous_scan_btn.clicked.connect(self._on_open_previous_scan_clicked)
+        toolbar2.addWidget(self.open_previous_scan_btn)
+
+        toolbar2.addSeparator()
+
         self.start_aggregate_btn = QPushButton("Start New Aggregate Batch")
         self.start_aggregate_btn.setToolTip(
             "Creates a new timestamped folder under IMAGES_ROOT and, from then on, files each "
@@ -266,6 +287,16 @@ class RegionDesignerWindow(QMainWindow):
         )
         self.start_aggregate_btn.clicked.connect(self._on_start_aggregate_clicked)
         toolbar2.addWidget(self.start_aggregate_btn)
+
+        self.finalize_results_btn = QPushButton("Finalize Results")
+        self.finalize_results_btn.setToolTip(
+            "Merges every scanned region's raw output into one Finalized/ folder under the aggregate "
+            "batch, with one combined scan_record.json - so this session's several per-region scans "
+            "can be handed to the post-processing pipeline as if they were one continuous scan. "
+            "Regions not yet scanned/confirmed are left out; run this again after scanning more."
+        )
+        self.finalize_results_btn.clicked.connect(self._on_finalize_results_clicked)
+        toolbar2.addWidget(self.finalize_results_btn)
 
     def _on_brush_radius_changed(self, value: int):
         self.canvas.brush_radius = value
@@ -353,9 +384,74 @@ class RegionDesignerWindow(QMainWindow):
         count = self.canvas.snap_focus_points_to_grid()
         self.status_label.setText(f"Snapped {count} focus point(s) to their nearest section center.")
 
+    def _on_reset_clicked(self):
+        if (
+            self.bridge.is_busy() or self._af_worker is not None or self._scan_worker is not None
+            or self._review_dialog is not None or self._auto_pipeline_active
+        ):
+            QMessageBox.warning(
+                self, "Reset",
+                "Finish or close out the current autofocus/scan/review operation first.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "Reset for New Scan",
+            "This clears the canvas (background image, painted sections, regions, focus points), all "
+            "plane-fit Z values, and forgets the current aggregate batch. Nothing already written to "
+            "disk is deleted. Continue?",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.canvas.reset()
+        self.region_focus_points = {}
+        self.section_z = {}
+        self._af_worker = None
+        self._af_region_id = None
+        self._af_region_items = []
+        self._af_log_path = None
+        self._scanning_region_id = None
+        self._scan_existing_run_folders = set()
+        self._aggregate_root = None
+        self._scan_recon_trackers = []
+        self._active_scan_tracker = None
+        self._auto_pipeline_region_ids = []
+        self._auto_pipeline_index = 0
+        self.region_id_spin.setMaximum(9999)
+        self.region_id_spin.setValue(0)
+        self.status_label.setText("Reset - ready for a new scan.")
+
+    def _on_open_previous_scan_clicked(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Select a previous aggregate batch folder", confirmation_scan.IMAGES_ROOT,
+        )
+        if not path:
+            return
+        self._aggregate_root = path
+        self.status_label.setText(f"Aggregate batch set to: {os.path.basename(path)}")
+
     def _on_start_aggregate_clicked(self):
         self._aggregate_root = scan_archive.start_new_aggregate_batch()
         self.status_label.setText(f"New aggregate batch: {os.path.basename(self._aggregate_root)}")
+
+    def _on_finalize_results_clicked(self):
+        if self._aggregate_root is None:
+            QMessageBox.warning(self, "Finalize Results", "Start a new aggregate batch first.")
+            return
+        try:
+            dest_dir, num_sections = scan_finalize.finalize_aggregate(
+                self._aggregate_root, self.canvas.region_of, self.section_z, self.region_focus_points,
+            )
+        except OSError as e:
+            QMessageBox.warning(self, "Finalize Results", f"Could not finalize results: {e}")
+            return
+        if num_sections == 0:
+            QMessageBox.information(
+                self, "Finalize Results", "No scanned, confirmed regions found yet - nothing to finalize."
+            )
+            return
+        self.status_label.setText(f"Finalized {num_sections} section(s) into {dest_dir}")
 
     def _on_load_calibration_clicked(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select a calibration data file", "", "JSON Files (*.json)")
@@ -728,6 +824,10 @@ class RegionDesignerWindow(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+
+        if self._aggregate_root is None:
+            self._aggregate_root = scan_archive.start_new_aggregate_batch()
+            self.status_label.setText(f"New aggregate batch: {os.path.basename(self._aggregate_root)}")
 
         self._auto_pipeline_active = True
         self._auto_pipeline_region_ids = region_ids
