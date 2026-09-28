@@ -61,6 +61,14 @@ class FocusPointItem(QGraphicsEllipseItem):
         x, y = geom.section_center(self._row, self._col, self.canvas.anchor, self.canvas.zoom)
         self.setPos(x, y)
 
+    def snap_to_grid(self):
+        """Rounds this point back to the exact center of whichever section it's
+        currently nearest to, undoing any free-form drag - see
+        SectionCanvas.snap_focus_points_to_grid."""
+        self._row = round(self._row)
+        self._col = round(self._col)
+        self._sync_position_from_section()
+
     def itemChange(self, change, value):
         if change == QGraphicsEllipseItem.GraphicsItemChange.ItemPositionHasChanged:
             # Dragging is free/continuous (no snapping to painted cells, and no

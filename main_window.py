@@ -158,6 +158,14 @@ class RegionDesignerWindow(QMainWindow):
         clear_regions_btn.clicked.connect(self._on_clear_regions_clicked)
         toolbar.addWidget(clear_regions_btn)
 
+        snap_focus_points_btn = QPushButton("Snap Focus Points to Grid")
+        snap_focus_points_btn.setToolTip(
+            "Resets every focus point (in every region) back to the exact center of "
+            "whichever section it's currently nearest to, undoing any manual drag."
+        )
+        snap_focus_points_btn.clicked.connect(self._on_snap_focus_points_clicked)
+        toolbar.addWidget(snap_focus_points_btn)
+
         toolbar.addSeparator()
 
         load_cal_btn = QPushButton("Load Calibration...")
@@ -340,6 +348,10 @@ class RegionDesignerWindow(QMainWindow):
     def _on_clear_regions_clicked(self):
         self.canvas.clear_regions()
         self.region_id_spin.setMaximum(9999)
+
+    def _on_snap_focus_points_clicked(self):
+        count = self.canvas.snap_focus_points_to_grid()
+        self.status_label.setText(f"Snapped {count} focus point(s) to their nearest section center.")
 
     def _on_start_aggregate_clicked(self):
         self._aggregate_root = scan_archive.start_new_aggregate_batch()

@@ -558,6 +558,15 @@ class SectionCanvas(QGraphicsView):
         self.focus_point_items.append(item)
         return item
 
+    def snap_focus_points_to_grid(self) -> int:
+        """Resets every focus point back to the exact center of its nearest
+        section, undoing any free-form drag - e.g. after points were dragged
+        against a grid anchor that later turned out to be wrong. Returns the
+        number of points snapped."""
+        for item in self.focus_point_items:
+            item.snap_to_grid()
+        return len(self.focus_point_items)
+
     def focus_points_by_region(self) -> dict[int, list[tuple[float, float]]]:
         """Continuous (row, col) per point (see FocusPointItem.section) - not the
         integer Section alias used for painted grid cells."""
