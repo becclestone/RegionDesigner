@@ -1169,6 +1169,18 @@ class RegionDesignerWindow(QMainWindow):
             if not is_inlier
         }
 
+        # Fit Region Plane already fills section_z (the actual Z a real Scan
+        # Region submits) from its own per-region plane - do the same here from
+        # the global one, over every currently compiled section (or every
+        # painted one, if regions haven't been compiled yet), so this plane's
+        # result is actually usable for scanning and not just an outlier
+        # report. A later per-region Fit Region Plane still overwrites its own
+        # region's sections with that more locally-fit result, same as running
+        # it twice always would.
+        sections_to_fill = list(self.canvas.region_of.keys()) or list(self.canvas.painted)
+        if sections_to_fill:
+            self.section_z.update(plane.fill_sections(sections_to_fill))
+
         self._refresh_focus_point_exclusion_visuals()
 
         residuals = plane.residuals()
@@ -1181,6 +1193,7 @@ class RegionDesignerWindow(QMainWindow):
         )
         self.status_label.setText(
             f"Global RANSAC plane: {len(input_points)} point(s) fit ({len(gathered)} total known), "
+            f"Z updated for {len(sections_to_fill)} section(s), "
             f"{excluded_count} excluded overall, max residual = {max(residuals):.4f}mm."
         )
 
