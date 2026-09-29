@@ -28,13 +28,20 @@ _DEFAULT_GLOBAL_FOCUS_POINTS = 12
 # A region scan's archive-to-aggregate-batch move waits for every section's
 # reconstruction-off message (see _on_section_reconstructing); _recheck_tracker_files
 # is the fallback for a message that never arrives, and re-checks the actual NR
-# file on disk rather than guessing a fixed wait time - real reconstruction lag
-# varies too much (single-section vs. large multi-section backlog, hardware
-# load, etc.) for any fixed number to be both safe and not-premature, so the
-# ground truth (the file's real presence) is what gates archiving, not a timer.
+# file on disk rather than guessing a fixed wait time.
 _RECON_POLL_INTERVAL_MS = 15 * 1000
-# Purely informational - keeps waiting either way, never forces an archive.
-_RECON_STALL_WARNING_S = 10 * 60
+# Reconstruction finishes sections in the same order they were scanned (the
+# controller processes its capture queue in order), so a tracker's "remaining"
+# list is kept in that same order and only its FRONT ever needs checking - once
+# it isn't there yet, nothing behind it will be either. Sections normally
+# finish no more than about this far apart; once it's been longer than that
+# since the last one arrived (live broadcast or found on disk), assume no more
+# are coming rather than wait on a fixed total budget that can't adapt to how
+# fast reconstruction actually is - see _recheck_tracker_files/
+# _on_section_reconstructing for where this is applied, and
+# _auto_pipeline_wait_tracker for why it also needs to release Auto Run All
+# Regions' hold on the next region rather than potentially wait forever.
+_RECON_GAP_TIMEOUT_S = 60
 
 # DOVER_UI is a sibling checkout that already carries the operator's calibration
 # (Stage Calibration tab, saved to its saved-calibration/ folder). Auto-loading its
@@ -500,7 +507,12 @@ class RegionDesignerWindow(QMainWindow):
         section = (master_row, master_col)
         for tracker in self._scan_recon_trackers:
             if section in tracker["remaining"]:
-                tracker["remaining"].discard(section)
+                tracker["remaining"].remove(section)
+                # Resets the gap clock _recheck_tracker_files measures against -
+                # see _RECON_GAP_TIMEOUT_S. Also clears warned so a later stall,
+                # after this arrival, can report again rather than staying silent.
+                tracker["last_arrival"] = time.monotonic()
+                tracker["warned"] = False
                 if tracker["ready"]:
                     self._maybe_archive_tracker(tracker)
 
@@ -1480,12 +1492,18 @@ class RegionDesignerWindow(QMainWindow):
         # sections in the path can complete well before the whole path does, and
         # this must catch those too, or the tracker would wait forever for
         # reconstruction-off events that already happened. Same master-grid
-        # offset RegionScanWorker itself applies internally.
-        master_sections = {
+        # offset RegionScanWorker itself applies internally. Kept as a LIST in
+        # the exact order sections_with_z (this same scan's own serpentine
+        # path order) gives them - see _RECON_GAP_TIMEOUT_S's docstring for why
+        # reconstruction is expected to finish them in this same order.
+        master_sections_ordered = [
             (int(round(self.calibration.offset_row + row)), int(round(self.calibration.offset_col + col)))
             for row, col, _z in sections_with_z
+        ]
+        tracker = {
+            "region_id": region_id, "remaining": master_sections_ordered, "folders": None,
+            "ready": False, "warned": False,
         }
-        tracker = {"region_id": region_id, "remaining": set(master_sections), "folders": None, "ready": False}
         self._scan_recon_trackers.append(tracker)
         self._active_scan_tracker = tracker
 
@@ -1519,8 +1537,11 @@ class RegionDesignerWindow(QMainWindow):
                     # out from under the writer still finishing it.
                     tracker["folders"] = new_run_folders
                     tracker["ready"] = True
-                    tracker["started"] = time.monotonic()
-                    tracker["warned"] = False
+                    # Only sets it if a live arrival (see _on_section_reconstructing)
+                    # didn't already, for a section that finished reconstructing
+                    # during the scan itself - that's still a more accurate baseline
+                    # than "now" for the gap clock below.
+                    tracker.setdefault("last_arrival", time.monotonic())
                     timer = QTimer(self)
                     timer.timeout.connect(lambda t=tracker: self._recheck_tracker_files(t))
                     tracker["timer"] = timer
@@ -1579,44 +1600,61 @@ class RegionDesignerWindow(QMainWindow):
 
     def _recheck_tracker_files(self, tracker: dict):
         """Periodic fallback for a region scan's archive-wait: re-checks the
-        actual NR file for every section still in tracker["remaining"] directly
-        on disk, in case its reconstruction-off message (see
-        _on_section_reconstructing) was ever missed. The file's real presence is
-        ground truth, so this resolves a stuck tracker without ever guessing a
-        fixed wait time - and, critically, can never archive while a file it
-        expects is actually still missing, however long that takes."""
+        actual NR file on disk, in case a reconstruction-off broadcast (see
+        _on_section_reconstructing) was ever missed. tracker["remaining"] is
+        kept in the exact order this region was scanned, and reconstruction is
+        expected to finish sections in that same order - so it's enough to
+        check from the front and stop at the first one not there yet, rather
+        than testing every remaining section on every poll.
+
+        Sections are expected no more than _RECON_GAP_TIMEOUT_S apart; once
+        that long has passed since the last one arrived (live or found here),
+        conclude no more are coming rather than wait on a fixed total budget
+        that can't adapt to how fast reconstruction actually is - and, if Auto
+        Run All Regions is holding on this tracker, release it so the next
+        region isn't blocked forever. The tracker itself is left running (still
+        polling, still eligible to archive) in case a genuinely late straggler
+        still shows up - this only gives up on WAITING for it."""
         if tracker not in self._scan_recon_trackers or not tracker["ready"]:
             timer = tracker.get("timer")
             if timer is not None:
                 timer.stop()
             return
 
-        found = set()
-        for master_row, master_col in tracker["remaining"]:
+        while tracker["remaining"]:
+            master_row, master_col = tracker["remaining"][0]
             filename = f"s-{master_row}-{master_col}_nr_float32.tif"
-            if any(os.path.isfile(os.path.join(folder, "NR", filename)) for folder in tracker["folders"]):
-                found.add((master_row, master_col))
-        if found:
-            tracker["remaining"] -= found
-            for master_row, master_col in found:
-                self._set_section_activity(master_row, master_col, "reconstructed")
+            if not any(os.path.isfile(os.path.join(folder, "NR", filename)) for folder in tracker["folders"]):
+                break
+            tracker["remaining"].pop(0)
+            tracker["last_arrival"] = time.monotonic()
+            tracker["warned"] = False
+            self._set_section_activity(master_row, master_col, "reconstructed")
 
         if not tracker["remaining"]:
             self._maybe_archive_tracker(tracker)
             return
 
-        elapsed = time.monotonic() - tracker["started"]
-        if elapsed > _RECON_STALL_WARNING_S and not tracker["warned"]:
+        gap = time.monotonic() - tracker["last_arrival"]
+        if gap <= _RECON_GAP_TIMEOUT_S:
+            return
+
+        if not tracker["warned"]:
             tracker["warned"] = True
             blocked_note = (
-                " The automated run is paused until then - it won't start the next region."
+                " Auto Run All Regions is proceeding to the next region rather than wait indefinitely."
                 if self._auto_pipeline_wait_tracker is tracker else ""
             )
             self.status_label.setText(
-                f"Region {tracker['region_id']}: still waiting on {len(tracker['remaining'])} section(s) to "
-                f"reconstruct after {elapsed / 60:.1f} min - scan data won't be archived until they're all "
-                f"done.{blocked_note}"
+                f"Region {tracker['region_id']}: no new reconstructed image in over "
+                f"{_RECON_GAP_TIMEOUT_S} s ({len(tracker['remaining'])} section(s) still unconfirmed) - "
+                f"assuming no more are coming.{blocked_note}"
             )
+
+        if self._auto_pipeline_wait_tracker is tracker:
+            self._auto_pipeline_wait_tracker = None
+            if self._auto_pipeline_active:
+                self._advance_auto_pipeline()
 
     def _on_region_scan_failed(self, message: str):
         region_id = self._scanning_region_id
