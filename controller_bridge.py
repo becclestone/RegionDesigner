@@ -118,6 +118,11 @@ class ControllerBridge(QObject):
         msg_type = msg.get_msg_type()
         if msg_type == ic.cIMAGE_READY_MSG:
             payload = msg.get_msg_payload()
+            # Mirrors DOVER_UI/Windows/demo_control_a.py's load_snapped_image:
+            # the snap sequence (request_snap above) turns the overview camera
+            # light on, so it must be turned back off once the image is in -
+            # otherwise it's left on indefinitely since nothing else does this.
+            sm.safemon_action_camera_light_off()
             self.imageReady.emit(payload[ic.cIMAGE_PATH])
         elif msg_type == ic.cCALCULATED_FOCUS_VALUES_MSG:
             self._autofocus_reply_queue.put(msg.get_msg_payload())
