@@ -148,6 +148,16 @@ class RegionDesignerWindow(QMainWindow):
         self._auto_pipeline_active = False
         self._auto_pipeline_region_ids: list[int] = []
         self._auto_pipeline_index: int = 0
+        # Set (to a _scan_recon_trackers entry) by _on_region_scan_finished right
+        # after a region's scan completes, while the pipeline is active - holds
+        # the pipeline from starting the next region's autofocus/confirmation
+        # captures until every section in that tracker reports reconstruction-
+        # off (see _maybe_archive_tracker, the single place that clears this and
+        # advances). Running the next region's hardware ops while the previous
+        # one's images are still reconstructing risks a real hardware conflict
+        # (same physical stage/camera resources) - see region_scan.py's
+        # module docstring for why reconstruction can otherwise lag behind.
+        self._auto_pipeline_wait_tracker: dict | None = None
 
         self._build_toolbar()
         self.status_label = QLabel("No calibration loaded.")
@@ -611,6 +621,7 @@ class RegionDesignerWindow(QMainWindow):
         self._active_scan_tracker = None
         self._auto_pipeline_region_ids = []
         self._auto_pipeline_index = 0
+        self._auto_pipeline_wait_tracker = None
         self.region_id_spin.setMaximum(9999)
         self.region_id_spin.setValue(0)
         self.status_label.setText("Reset - ready for a new scan.")
@@ -1488,12 +1499,12 @@ class RegionDesignerWindow(QMainWindow):
     def _on_region_scan_finished(self):
         region_id = self._scanning_region_id
         self._set_hardware_controls_enabled(True)
-        self.status_label.setText(f"Region {region_id}: scan complete.")
         self.canvas.set_region_status(region_id, "scanned")
         self._scanning_region_id = None
 
         tracker = self._active_scan_tracker
         self._active_scan_tracker = None
+        waiting_on_recon = False
         if tracker is not None:
             if self._aggregate_root is not None:
                 new_folder_names = confirmation_scan.list_run_folders() - self._scan_existing_run_folders
@@ -1514,14 +1525,39 @@ class RegionDesignerWindow(QMainWindow):
                     timer.timeout.connect(lambda t=tracker: self._recheck_tracker_files(t))
                     tracker["timer"] = timer
                     timer.start(_RECON_POLL_INTERVAL_MS)
+                    if self._auto_pipeline_active:
+                        # Hold the pipeline here - see _auto_pipeline_wait_tracker's
+                        # docstring for why starting the next region's hardware ops
+                        # before this region's images finish reconstructing is
+                        # unsafe. _maybe_archive_tracker (called just below, and
+                        # again from _on_section_reconstructing/
+                        # _recheck_tracker_files as more sections finish) is what
+                        # actually clears this and advances, once tracker["remaining"]
+                        # is finally empty - which can happen synchronously in the
+                        # call just below, if reconstruction already finished for
+                        # every section during the scan itself.
+                        self._auto_pipeline_wait_tracker = tracker
+                        waiting_on_recon = True
                     self._maybe_archive_tracker(tracker)
                 else:
                     self._scan_recon_trackers.remove(tracker)
             else:
                 self._scan_recon_trackers.remove(tracker)  # no aggregate active - nothing to archive
 
-        if self._auto_pipeline_active:
-            self._advance_auto_pipeline()
+        if waiting_on_recon:
+            # _maybe_archive_tracker just above may already have resolved this
+            # (and advanced the pipeline) synchronously if every section had
+            # already finished reconstructing - only report "waiting" if it's
+            # actually still waiting.
+            if self._auto_pipeline_wait_tracker is tracker:
+                self.status_label.setText(
+                    f"Region {region_id}: scan complete - waiting for its images to finish reconstructing "
+                    f"before starting the next region (avoids a hardware conflict)..."
+                )
+        else:
+            self.status_label.setText(f"Region {region_id}: scan complete.")
+            if self._auto_pipeline_active:
+                self._advance_auto_pipeline()
 
     def _maybe_archive_tracker(self, tracker: dict):
         if not tracker["ready"] or tracker["remaining"]:
@@ -1532,6 +1568,14 @@ class RegionDesignerWindow(QMainWindow):
         scan_archive.archive_region_scan(self._aggregate_root, tracker["region_id"], tracker["folders"])
         if tracker in self._scan_recon_trackers:
             self._scan_recon_trackers.remove(tracker)
+
+        if self._auto_pipeline_wait_tracker is tracker:
+            # This region's images are now fully reconstructed - safe to start
+            # the next region's autofocus/confirmation captures. See
+            # _auto_pipeline_wait_tracker's docstring.
+            self._auto_pipeline_wait_tracker = None
+            if self._auto_pipeline_active:
+                self._advance_auto_pipeline()
 
     def _recheck_tracker_files(self, tracker: dict):
         """Periodic fallback for a region scan's archive-wait: re-checks the
@@ -1564,9 +1608,14 @@ class RegionDesignerWindow(QMainWindow):
         elapsed = time.monotonic() - tracker["started"]
         if elapsed > _RECON_STALL_WARNING_S and not tracker["warned"]:
             tracker["warned"] = True
+            blocked_note = (
+                " The automated run is paused until then - it won't start the next region."
+                if self._auto_pipeline_wait_tracker is tracker else ""
+            )
             self.status_label.setText(
                 f"Region {tracker['region_id']}: still waiting on {len(tracker['remaining'])} section(s) to "
-                f"reconstruct after {elapsed / 60:.1f} min - scan data won't be archived until they're all done."
+                f"reconstruct after {elapsed / 60:.1f} min - scan data won't be archived until they're all "
+                f"done.{blocked_note}"
             )
 
     def _on_region_scan_failed(self, message: str):
