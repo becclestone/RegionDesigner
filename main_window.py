@@ -1295,12 +1295,17 @@ class RegionDesignerWindow(QMainWindow):
                 "unavailable": "This point hasn't completed an autofocus sweep yet.",
             }
 
-        # The plane actually in effect for this point right now - the global
-        # RANSAC plane for a global point, or this region's own last Fit Region
-        # Plane result - so the dialog can show how far its chosen Z sits from
-        # what that plane predicts. None if that plane hasn't been fit yet (or
-        # was invalidated by a later reconfirm).
-        plane = self.global_plane if is_global else self.region_planes.get(item.region_id)
+        # The plane actually in effect for this point's section right now - its
+        # own region's last Fit Region Plane result if it has one, otherwise
+        # (same fallback _on_fit_global_plane_clicked itself uses when filling
+        # section_z) the global RANSAC plane, since that may be what actually
+        # last set this section's Z if Fit Region Plane was never separately
+        # run for it. A global point always uses the global plane. None if
+        # neither has ever been fit yet (or the region one was invalidated by a
+        # later reconfirm).
+        plane = None if is_global else self.region_planes.get(item.region_id)
+        if plane is None:
+            plane = self.global_plane
         plane_z = plane.z_at(item.fit.row, item.fit.col) if plane is not None else None
         return {"label": label, "excluded": excluded, "fit": item.fit, "z": item.z, "plane_z": plane_z}
 
