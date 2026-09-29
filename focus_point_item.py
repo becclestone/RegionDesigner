@@ -19,16 +19,37 @@ _STATUS_FILL_COLORS = {
     "failed": QColor(230, 70, 70, 210),
 }
 
+# Drawn instead of the status color above whenever main_window considers this
+# point excluded from plane fitting - whether that's the Global Focus Search's
+# own RANSAC outlier flag, or a manual override set via shift-click (see
+# FocusPointInspectorDialog) - so "excluded" always looks the same regardless
+# of why, and always wins over "done"/"failed".
+_EXCLUDED_FILL_COLOR = QColor(90, 90, 90, 220)
+
+# Global focus points (region_id=None - not tied to any one compiled region,
+# see main_window's Global Focus Search controls) get a fixed neutral border
+# instead of a per-region palette color, since they aren't associated with one.
+_GLOBAL_BORDER_COLOR = QColor(255, 255, 255)
+
 
 class FocusPointItem(QGraphicsEllipseItem):
-    def __init__(self, region_id: int, row: int, col: int, canvas):
+    def __init__(self, region_id: int | None, row: int, col: int, canvas):
         super().__init__(-_RADIUS_PX, -_RADIUS_PX, _RADIUS_PX * 2, _RADIUS_PX * 2)
         self.region_id = region_id
         self.canvas = canvas
         self._row = row
         self._col = col
+        self._status: str | None = None
+        self.excluded = False  # manual-or-auto "leave out of plane fitting" flag - see set_excluded
+        # Set by main_window once this point's autofocus sweep completes
+        # (focus_fitting.FocusFit) and its confirmed Z once the operator accepts
+        # it - kept here so a later shift-click (see
+        # canvas_view.SectionCanvas.focusPointShiftClicked) can reopen this
+        # exact point's curve without main_window having to hunt for it.
+        self.fit = None
+        self.z: float | None = None
 
-        border_color = QColor(region_color(region_id))
+        border_color = QColor(_GLOBAL_BORDER_COLOR if region_id is None else region_color(region_id))
         border_color.setAlpha(_BORDER_ALPHA)
 
         self.setBrush(QBrush(_FILL_COLOR))
@@ -42,7 +63,20 @@ class FocusPointItem(QGraphicsEllipseItem):
 
     def set_status(self, status: str | None):
         """status is None (pending), "focusing", "done", or "failed"."""
-        self.setBrush(QBrush(_STATUS_FILL_COLORS.get(status, _FILL_COLOR)))
+        self._status = status
+        self._refresh_brush()
+
+    def set_excluded(self, excluded: bool):
+        """Marks (or unmarks) this point as left out of plane fitting - drawn as
+        a distinct dark grey regardless of its focusing status. See
+        main_window._refresh_focus_point_exclusion_visuals, the single place
+        that decides this from the RANSAC outlier flag and any manual override."""
+        self.excluded = excluded
+        self._refresh_brush()
+
+    def _refresh_brush(self):
+        color = _EXCLUDED_FILL_COLOR if self.excluded else _STATUS_FILL_COLORS.get(self._status, _FILL_COLOR)
+        self.setBrush(QBrush(color))
 
     def section(self) -> tuple[float, float]:
         """Continuous (row, col) - not snapped to a grid cell. Use this for

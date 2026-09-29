@@ -22,9 +22,12 @@ _AUTO_SEARCH_LABEL = "Auto Search for Max Contrast (≤3 extra images)"
 
 
 class FocusReviewDialog(QDialog):
-    def __init__(self, bridge, calibration, region_id: int, fits: list[focus_fitting.FocusFit], parent=None):
+    def __init__(
+        self, bridge, calibration, region_id: int, fits: list[focus_fitting.FocusFit], parent=None,
+        title: str | None = None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle(f"Review Focus Points - Region {region_id}")
+        self.setWindowTitle(title or f"Review Focus Points - Region {region_id}")
         self.resize(1000, 650)
         self.bridge = bridge
         self.calibration = calibration
@@ -150,13 +153,10 @@ class FocusReviewDialog(QDialog):
 
     def finish_collecting(self):
         """Called once the region's AutofocusSequenceWorker has finished (all
-        points attempted, z_opt values finalized) - unblocks review/accept."""
+        points attempted) - unblocks review/accept."""
         self._collecting = False
         self._update_collecting_ui()
         self._refresh_scan_controls()
-        # z_opt for any 'is_right' point is only resolved by finalize_region()
-        # once the whole region is in, so refresh the currently shown plot/label
-        # in case the selected point's z_opt just changed.
         self._on_point_selected(self.list_widget.currentRow())
 
         if self._auto_confirm_region:

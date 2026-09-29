@@ -11,19 +11,35 @@ from sklearn import linear_model
 
 
 class RegionPlaneFit:
-    def __init__(self, focus_points: list[tuple[float, float, float]]):
-        """focus_points: [(row, col, z), ...] - user-confirmed focus values."""
+    def __init__(self, focus_points: list[tuple[float, float, float]], residual_threshold: float | None = None):
+        """focus_points: [(row, col, z), ...] - user-confirmed focus values.
+        residual_threshold: RANSACRegressor's own inlier cutoff (mm of perpendicular
+        Z distance from the candidate plane) - None uses sklearn's default
+        MAD-based auto estimate. Exposed so a global, sample-wide fit (see
+        main_window's Global Focus Search controls) can be tuned to reliably
+        flag real outliers (a fold, dust) without also rejecting normal points
+        on a legitimately tilted sample."""
         if len(focus_points) < 3:
             raise ValueError("Need at least 3 confirmed focus points to fit a plane.")
         self._xyz = np.array(focus_points, dtype=float)
+        self._ransac = linear_model.RANSACRegressor(residual_threshold=residual_threshold)
         self.plane_coeff = self._fit()
 
     def _fit(self) -> np.ndarray:
-        ransac = linear_model.RANSACRegressor()
-        ransac.fit(self._xyz[:, 0:2], self._xyz[:, 2])
-        a, b = ransac.estimator_.coef_
-        d = ransac.estimator_.intercept_
+        self._ransac.fit(self._xyz[:, 0:2], self._xyz[:, 2])
+        a, b = self._ransac.estimator_.coef_
+        d = self._ransac.estimator_.intercept_
         return np.array([a, b, d])
+
+    def inlier_mask(self) -> list[bool]:
+        """Per-input-point RANSAC inlier flag (True = consistent with the fitted
+        plane, False = the fit's own outlier classification) - same order as the
+        focus_points list passed to __init__."""
+        return list(self._ransac.inlier_mask_)
+
+    def outlier_points(self) -> list[tuple[float, float, float]]:
+        """The input focus points RANSAC classified as outliers - diagnostic only."""
+        return [tuple(pt) for pt, is_inlier in zip(self._xyz, self.inlier_mask()) if not is_inlier]
 
     def z_at(self, row: float, col: float) -> float:
         a, b, d = self.plane_coeff

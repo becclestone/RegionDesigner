@@ -105,6 +105,10 @@ _SECTION_ACTIVITY_COLORS = {
 
 class SectionCanvas(QGraphicsView):
     sectionsChanged = Signal()
+    focusPointShiftClicked = Signal(object)  # FocusPointItem - see mousePressEvent
+    # region_id (int, or None for a global point), row, col - see mouseDoubleClickEvent
+    focusPointAddRequested = Signal(object, float, float)
+    focusPointRemoveRequested = Signal(object)  # FocusPointItem - see mousePressEvent
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -146,6 +150,11 @@ class SectionCanvas(QGraphicsView):
         self._brush_cursor_item: QGraphicsEllipseItem | None = None
 
         self.focus_point_items: list[FocusPointItem] = []
+        # Separate from focus_point_items (region_id=None, not tied to a
+        # compiled region) so Compile Regions/Clear Regions - which reset the
+        # per-region list - don't also throw away a Global Focus Search run.
+        # See main_window's Global Focus Search controls.
+        self.global_focus_point_items: list[FocusPointItem] = []
 
     # ---- background image ----
     def reset(self):
@@ -170,6 +179,7 @@ class SectionCanvas(QGraphicsView):
         self.region_progress = {}
         self.section_activity = {}
         self.clear_focus_points()
+        self.clear_global_focus_points()
 
     def set_background_image(self, path: str):
         pixmap = _pil_to_qpixmap(_load_registered_image(path))
@@ -212,6 +222,28 @@ class SectionCanvas(QGraphicsView):
 
     # ---- mouse handling: paint, or forward to Qt's item-drag for focus points ----
     def mousePressEvent(self, event: QMouseEvent):
+        # Shift+click a focus point marker to review/override it - checked first
+        # (and unconditionally, regardless of draw_mode/painting) so it always
+        # wins over both brush painting and the marker's own drag behavior. See
+        # main_window._on_focus_point_shift_clicked.
+        if event.button() == Qt.MouseButton.LeftButton and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            clicked_item = self.itemAt(event.position().toPoint())
+            if isinstance(clicked_item, FocusPointItem):
+                self.focusPointShiftClicked.emit(clicked_item)
+                event.accept()
+                return
+
+        # Right-click a focus point marker to remove it outright - checked next,
+        # same unconditional priority as the shift+click case above, so it wins
+        # over the brush's own right-click-to-erase behavior when the cursor is
+        # actually over a marker. See main_window._on_focus_point_remove_requested.
+        if event.button() == Qt.MouseButton.RightButton:
+            clicked_item = self.itemAt(event.position().toPoint())
+            if isinstance(clicked_item, FocusPointItem):
+                self.focusPointRemoveRequested.emit(clicked_item)
+                event.accept()
+                return
+
         if event.button() == Qt.MouseButton.MiddleButton:
             self._panning = True
             self._pan_last_pos = event.position()
@@ -234,6 +266,29 @@ class SectionCanvas(QGraphicsView):
             return
 
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """Double-click empty canvas to add a focus point there - into whichever
+        region owns the section under the cursor, or as a global point (see
+        main_window's Global Focus Search controls) if that section isn't
+        painted/assigned to one yet. Double-clicking an existing marker does
+        nothing special here (falls through to Qt's normal handling).
+
+        Note: while draw_mode is still True (regions not yet compiled), Qt's own
+        double-click sequence still delivers the first press/release as a
+        normal click first - see mousePressEvent - so this can also paint or
+        erase one section under the cursor as a side effect. Compiling regions
+        first (which turns draw_mode off) avoids that."""
+        if self.mask_image is not None and event.button() == Qt.MouseButton.LeftButton:
+            clicked_item = self.itemAt(event.position().toPoint())
+            if not isinstance(clicked_item, FocusPointItem):
+                scene_pos = self.mapToScene(event.position().toPoint())
+                row, col = geom.point_to_section_center_f(scene_pos.x(), scene_pos.y(), self.anchor, self.zoom)
+                region_id = self.region_of.get((int(round(row)), int(round(col))))
+                self.focusPointAddRequested.emit(region_id, row, col)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if self._panning:
@@ -581,14 +636,27 @@ class SectionCanvas(QGraphicsView):
         self.focus_point_items.append(item)
         return item
 
+    def remove_focus_point(self, item: FocusPointItem):
+        """Removes one focus point marker - region or global, whichever list it's
+        actually in - see main_window._on_focus_point_remove_requested (right-click)."""
+        if item in self.focus_point_items:
+            self.focus_point_items.remove(item)
+        elif item in self.global_focus_point_items:
+            self.global_focus_point_items.remove(item)
+        else:
+            return
+        self._scene.removeItem(item)
+
     def snap_focus_points_to_grid(self) -> int:
-        """Resets every focus point back to the exact center of its nearest
-        section, undoing any free-form drag - e.g. after points were dragged
-        against a grid anchor that later turned out to be wrong. Returns the
-        number of points snapped."""
+        """Resets every focus point (region and global) back to the exact center
+        of its nearest section, undoing any free-form drag - e.g. after points
+        were dragged against a grid anchor that later turned out to be wrong.
+        Returns the number of points snapped."""
         for item in self.focus_point_items:
             item.snap_to_grid()
-        return len(self.focus_point_items)
+        for item in self.global_focus_point_items:
+            item.snap_to_grid()
+        return len(self.focus_point_items) + len(self.global_focus_point_items)
 
     def focus_points_by_region(self) -> dict[int, list[tuple[float, float]]]:
         """Continuous (row, col) per point (see FocusPointItem.section) - not the
@@ -597,3 +665,20 @@ class SectionCanvas(QGraphicsView):
         for item in self.focus_point_items:
             out.setdefault(item.region_id, []).append(item.section())
         return out
+
+    # ---- global focus points (Global Focus Search - not tied to a region) ----
+    def clear_global_focus_points(self):
+        for item in self.global_focus_point_items:
+            self._scene.removeItem(item)
+        self.global_focus_point_items.clear()
+
+    def add_global_focus_point(self, row: int, col: int) -> FocusPointItem:
+        item = FocusPointItem(None, row, col, self)
+        self._scene.addItem(item)
+        self.global_focus_point_items.append(item)
+        return item
+
+    def global_focus_points(self) -> list[tuple[float, float]]:
+        """Continuous (row, col) per global focus point, same convention as
+        focus_points_by_region()."""
+        return [item.section() for item in self.global_focus_point_items]

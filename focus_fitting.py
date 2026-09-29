@@ -1,11 +1,14 @@
-"""Ports surface_calc's per-point curve fit + candidate-peak selection, and its
-region-level averaging step, to operate on raw (z_values, metric_values) arrays
-instead of file-parsed Section objects fed by parse_scan_record.
+"""Ports surface_calc's per-point curve fit to operate on raw (z_values,
+metric_values) arrays instead of file-parsed Section objects fed by
+parse_scan_record.
 
-See Scan_UI/surface_calc/surface_fitting.py:10-84 (Focus_Fitting) and :97-110
-(Surface_Fitting.get_valid_focuses) for the originals this is a direct port of -
-same math, same two-Lorentzian mixture model, same "is_right" ambiguity-resolution
-heuristic. Kept free of Qt/plotting so it's independently testable.
+See Scan_UI/surface_calc/surface_fitting.py:10-84 (Focus_Fitting) for the
+original this is a port of - same math, same two-Lorentzian mixture model.
+Unlike the original (and unlike this module's own earlier version), the
+picked focus is always the left/near peak (get_peaks()[0]) - no is_right
+ambiguity heuristic or region-level averaging - and the max-sharpness sample
+is used only as a fallback for when the curve fit itself fails. Kept free of
+Qt/plotting so it's independently testable.
 """
 import numpy as np
 from scipy.optimize import curve_fit
@@ -20,9 +23,8 @@ def _mixture_model(z, a1, c1, w1, a2, c2, w2):
 
 
 class FocusFit:
-    """One point's fitted curve. z_opt is provisional until finalize_region() runs:
-    an 'is_right' point's z_opt isn't set by fit() alone - it needs the region's
-    average peak_offset from the resolved ('not is_right') points first."""
+    """One point's fitted curve. z_opt is the left (near) peak of the fitted
+    two-Lorentzian mixture, or max_loc if the curve fit failed."""
 
     def __init__(self, row: float, col: float, z_values, metric_values):
         self.row = row
@@ -33,8 +35,6 @@ class FocusFit:
         self.max_loc = float(self.z[np.argmax(self.f)])
         self.params = None
         self.peak_locs = None
-        self.is_right = False
-        self.peak_offset = None
         self.z_opt = None
 
     def normalized_f(self):
@@ -49,23 +49,19 @@ class FocusFit:
         try:
             popt, _ = curve_fit(_mixture_model, self.z, temp_f, p0=init_params, maxfev=100000)
         except RuntimeError:
-            popt = init_params
+            # Curve fit failed to converge - fall back to the raw max-sharpness
+            # sample rather than trusting an unconverged/init-guess curve.
+            self.params = None
+            self.peak_locs = None
+            self.z_opt = self.max_loc
+            return
 
         self.params = popt
-        self.peak_locs = [min(popt[1], popt[4]), max(popt[1], popt[4])]
-        self._check_focus_preference()
+        self.peak_locs = self.get_peaks()
+        self.z_opt = self.peak_locs[0]
 
-    def _check_focus_preference(self):
-        if abs(self.peak_locs[0] - self.peak_locs[1]) < 0.4:
-            self.peak_offset = 0.0
-            self.z_opt = self.max_loc
-            self.is_right = False
-        elif self.max_loc > (self.peak_locs[0] + self.peak_locs[1]) / 2:
-            self.is_right = True
-        else:
-            self.peak_offset = abs(self.max_loc - self.peak_locs[0])
-            self.z_opt = self.max_loc
-            self.is_right = False
+    def get_peaks(self):
+        return [min(self.params[1], self.params[4]), max(self.params[1], self.params[4])]
 
     def curve_preview(self, num_points: int = 500):
         """z/metric samples of the fitted mixture model curve, for plotting."""
@@ -74,30 +70,12 @@ class FocusFit:
 
     def to_dict(self) -> dict:
         """JSON-serializable snapshot of the fine stage's sweep + fit, for
-        autofocus_log.py. Only meaningful once fit() (and, for an 'is_right'
-        point, finalize_region()) has already run."""
+        autofocus_log.py. Only meaningful once fit() has already run."""
         return {
             "z_values": self.z.tolist(),
             "metric_values": self.f.tolist(),
-            # self.params is an ndarray after a successful curve_fit, but a plain
-            # list of the init guess (see fit()'s RuntimeError fallback) otherwise
-            # - float(x) covers both instead of assuming .tolist() exists.
             "params": [float(x) for x in self.params] if self.params is not None else None,
             "peak_locs": self.peak_locs,
             "max_loc": self.max_loc,
-            "is_right": self.is_right,
-            "peak_offset": self.peak_offset,
             "z_opt": self.z_opt,
         }
-
-
-def finalize_region(fits: list[FocusFit]) -> None:
-    """Ports Surface_Fitting.get_valid_focuses(): resolves any 'is_right' point's
-    z_opt using the average peak_offset of the region's resolved points."""
-    resolved = [f for f in fits if not f.is_right]
-    if not resolved:
-        return
-    avg_peak_offset = sum(f.peak_offset for f in resolved) / len(resolved)
-    for f in fits:
-        if f.is_right:
-            f.z_opt = f.peak_locs[0] + avg_peak_offset

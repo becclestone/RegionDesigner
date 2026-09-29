@@ -20,8 +20,9 @@ Stage roles:
   point* ended up, since neighboring points shouldn't need a fresh coarse search.
 - fine: the narrowest, finest-step sweep, centered on medium's result. This is the
   only stage fitted via focus_fitting.FocusFit (surface_calc's curve fit), and its
-  fitted z_opt is both the point's reported focus and the center fed to the next
-  point's medium stage.
+  fitted z_opt (the left/near peak of the fitted curve, or the max-sharpness
+  sample if the fit fails) is both the point's reported focus and the center fed
+  to the next point's medium stage.
 
 Stage sizes (num_layers, z_step) are loaded from autofocus_config.json so they can
 be tuned without a code change; see _DEFAULT_STAGE_CONFIG for the fallback/expected
@@ -81,9 +82,9 @@ class AutofocusSequenceWorker(QObject):
         self.z_start = z_start
         self.fits: list[focus_fitting.FocusFit] = []
         # One dict per point, in point order, for autofocus_log.py - coarse/medium
-        # sweep data plus (once finalize_region() has run) the fine stage's
-        # to_dict(). Populated even for a point whose sweeps raised partway
-        # through (status/error fields), unlike self.fits.
+        # sweep data plus the fine stage's to_dict(). Populated even for a point
+        # whose sweeps raised partway through (status/error fields), unlike
+        # self.fits.
         self.records: list[dict] = []
         self.stage_config = _load_stage_config()
 
@@ -129,13 +130,9 @@ class AutofocusSequenceWorker(QObject):
                 record["error"] = str(e)
                 self.pointFailed.emit(index, str(e))
             finally:
-                # Stashed as a raw FocusFit for now - fine stage's is_right z_opt
-                # isn't resolved until finalize_region() runs below, after every
-                # point in the region has been attempted.
                 record["_fit"] = fit
                 self.records.append(record)
 
-        focus_fitting.finalize_region(self.fits)
         for record in self.records:
             fit = record.pop("_fit")
             record["fine"] = fit.to_dict() if fit is not None else None
