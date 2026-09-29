@@ -22,9 +22,14 @@ _STATUS_FILL_COLORS = {
 # Drawn instead of the status color above whenever main_window considers this
 # point excluded from plane fitting - whether that's the Global Focus Search's
 # own RANSAC outlier flag, or a manual override set via shift-click (see
-# FocusPointInspectorDialog) - so "excluded" always looks the same regardless
-# of why, and always wins over "done"/"failed".
+# plane_fit_review_dialog.PlaneFitReviewDialog) - so "excluded" always looks
+# the same regardless of why, and always wins over "done"/"failed".
 _EXCLUDED_FILL_COLOR = QColor(90, 90, 90, 255)
+
+# Drawn instead of either color above while this is the point currently
+# selected in a PlaneFitReviewDialog - see set_highlighted - so it can be
+# spotted on the sample regardless of its focusing/exclusion status.
+_HIGHLIGHT_COLOR = QColor(255, 0, 0, 255)
 
 # Global focus points (region_id=None - not tied to any one compiled region,
 # see main_window's Global Focus Search controls) get a fixed neutral border
@@ -41,6 +46,7 @@ class FocusPointItem(QGraphicsEllipseItem):
         self._col = col
         self._status: str | None = None
         self.excluded = False  # manual-or-auto "leave out of plane fitting" flag - see set_excluded
+        self.highlighted = False  # "selected in the plane-fit review list" flag - see set_highlighted
         # Set by main_window once this point's autofocus sweep completes
         # (focus_fitting.FocusFit) and its confirmed Z once the operator accepts
         # it - kept here so a later shift-click (see
@@ -74,8 +80,23 @@ class FocusPointItem(QGraphicsEllipseItem):
         self.excluded = excluded
         self._refresh_brush()
 
+    def set_highlighted(self, highlighted: bool):
+        """Marks (or unmarks) this point as the one currently selected in a
+        PlaneFitReviewDialog - drawn bright red and raised above other markers
+        so it's easy to find on the sample, regardless of its focusing/
+        exclusion status. Purely a display flag; doesn't affect plane fitting.
+        See main_window._on_plane_review_selection_changed."""
+        self.highlighted = highlighted
+        self.setZValue(20 if highlighted else 10)
+        self._refresh_brush()
+
     def _refresh_brush(self):
-        color = _EXCLUDED_FILL_COLOR if self.excluded else _STATUS_FILL_COLORS.get(self._status, _FILL_COLOR)
+        if self.highlighted:
+            color = _HIGHLIGHT_COLOR
+        elif self.excluded:
+            color = _EXCLUDED_FILL_COLOR
+        else:
+            color = _STATUS_FILL_COLORS.get(self._status, _FILL_COLOR)
         self.setBrush(QBrush(color))
 
     def section(self) -> tuple[float, float]:

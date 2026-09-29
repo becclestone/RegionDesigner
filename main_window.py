@@ -17,7 +17,7 @@ import scan_finalize
 from stage_calibration import StageCalibration
 from autofocus_client import AutofocusSequenceWorker
 from focus_review_dialog import FocusReviewDialog
-from focus_point_inspector import FocusPointInspectorDialog
+from plane_fit_review_dialog import PlaneFitReviewDialog
 from region_plane_fit import RegionPlaneFit
 from region_scan import RegionScanWorker
 
@@ -119,6 +119,14 @@ class RegionDesignerWindow(QMainWindow):
         # final in-or-out decision for plane fitting.
         self.region_inclusion_override: dict[int, dict[tuple[int, int], bool]] = {}
         self.global_inclusion_override: dict[tuple[int, int], bool] = {}
+
+        # The one PlaneFitReviewDialog open at a time (see
+        # _open_plane_review_dialog), and whichever of its points is currently
+        # selected/highlighted red on the canvas (see
+        # _on_plane_review_selection_changed) - kept here so it can be
+        # un-highlighted the moment selection moves on or the dialog closes.
+        self._plane_review_dialog: PlaneFitReviewDialog | None = None
+        self._plane_review_highlighted_item = None
 
         self._scan_worker = None
         self._scanning_region_id: int | None = None
@@ -274,6 +282,16 @@ class RegionDesignerWindow(QMainWindow):
         self.fit_plane_btn.clicked.connect(self._on_fit_plane_clicked)
         toolbar2.addWidget(self.fit_plane_btn)
 
+        self.review_region_plane_fit_btn = QPushButton("Review Region Plane Fit")
+        self.review_region_plane_fit_btn.setToolTip(
+            "Lists every focus point in the current region - click through them to see each one's focus "
+            "curve and how far it sits from the fitted plane, with its marker highlighted red on the "
+            "canvas so it can be found on the sample. Also opens (pre-selected to the clicked point) by "
+            "shift+clicking any region marker."
+        )
+        self.review_region_plane_fit_btn.clicked.connect(self._on_review_region_plane_fit_clicked)
+        toolbar2.addWidget(self.review_region_plane_fit_btn)
+
         self.scan_region_btn = QPushButton("Scan Region")
         self.scan_region_btn.setToolTip(
             "Submits every painted section in this region, with its Fit Region Plane Z, as one real "
@@ -411,6 +429,16 @@ class RegionDesignerWindow(QMainWindow):
         self.fit_global_plane_btn.clicked.connect(self._on_fit_global_plane_clicked)
         toolbar3.addWidget(self.fit_global_plane_btn)
 
+        self.review_global_plane_fit_btn = QPushButton("Review Global Plane Fit")
+        self.review_global_plane_fit_btn.setToolTip(
+            "Lists every point the last Global Focus Search ran on - click through them to see each one's "
+            "focus curve and how far it sits from the global plane, with its marker highlighted red on the "
+            "canvas so it can be found on the sample. Also opens (pre-selected to the clicked point) by "
+            "shift+clicking any global marker."
+        )
+        self.review_global_plane_fit_btn.clicked.connect(self._on_review_global_plane_fit_clicked)
+        toolbar3.addWidget(self.review_global_plane_fit_btn)
+
         self.exclude_global_outliers_checkbox = QCheckBox("Exclude flagged outliers from region search")
         self.exclude_global_outliers_checkbox.setChecked(True)
         self.exclude_global_outliers_checkbox.setToolTip(
@@ -428,8 +456,9 @@ class RegionDesignerWindow(QMainWindow):
 
         toolbar3.addSeparator()
         toolbar3.addWidget(QLabel(
-            " Shift+click a focus point to review/override it - double-click empty canvas to add one, "
-            "right-click a point to remove it. "
+            " Shift+click a focus point to open its plane-fit review list (selecting a point there "
+            "highlights it red on the canvas) - double-click empty canvas to add a point, right-click one "
+            "to remove it. "
         ))
 
     def _on_brush_radius_changed(self, value: int):
@@ -571,6 +600,10 @@ class RegionDesignerWindow(QMainWindow):
         self._global_auto_fit_after_search = False
         self.region_inclusion_override = {}
         self.global_inclusion_override = {}
+        if self._plane_review_dialog is not None:
+            self._plane_review_dialog.close()
+        self._plane_review_dialog = None
+        self._plane_review_highlighted_item = None
         self._scanning_region_id = None
         self._scan_existing_run_folders = set()
         self._aggregate_root = None
@@ -758,7 +791,7 @@ class RegionDesignerWindow(QMainWindow):
             # Fresh confirmation - this region's prior manual include/exclude
             # overrides (if any) no longer necessarily apply to the same points,
             # and any previously fit plane is now stale until Fit Region Plane
-            # is run again (see FocusPointInspectorDialog's plane-error display).
+            # is run again (see PlaneFitReviewDialog's plane-error display).
             self.region_inclusion_override[region_id] = {}
             self.region_planes.pop(region_id, None)
             self._record_confirmed_z(
@@ -1042,7 +1075,7 @@ class RegionDesignerWindow(QMainWindow):
         object identity (the exact same FocusFit set on item.fit when its
         autofocus sweep completed - see _on_autofocus_point_fitted/
         _on_global_af_point_fitted). Lets a later shift-click review
-        (FocusPointInspectorDialog) show the actual confirmed Z, which can
+        (PlaneFitReviewDialog) show the actual confirmed Z, which can
         differ from the fit's own automatic z_opt (confirmed via scan or
         manual override)."""
         fit_id_to_item = {id(it.fit): it for it in items if it.fit is not None}
@@ -1051,23 +1084,67 @@ class RegionDesignerWindow(QMainWindow):
             if item is not None:
                 item.z = dialog.confirmed_z.get(i)
 
+    def _gather_global_focus_points(self) -> list[tuple[int | None, float, float, float]]:
+        """Every point currently available to fit a whole-sample plane over -
+        (origin_region_id_or_None, row, col, z) - gathered FRESH each time Fit
+        Global RANSAC Plane runs, rather than relying on a snapshot that only a
+        Global Focus Search run populates: every compiled region's own
+        confirmed focus points count too, however they got confirmed (normal
+        per-region autofocus, or reused via Run Global Focus Plane Fitting) -
+        not just points from a standalone global sweep. This is what makes
+        pressing Fit Global RANSAC Plane directly, after just running the
+        regions' own autofocus normally, actually do something."""
+        points: list[tuple[int | None, float, float, float]] = []
+        covered_cells: set[tuple[int, int]] = set()
+        for region_id, region_points in self.region_focus_points.items():
+            for row, col, z in region_points:
+                points.append((region_id, row, col, z))
+                covered_cells.add((int(round(row)), int(round(col))))
+
+        for item in self.canvas.global_focus_point_items:
+            if item.fit is None or item.z is None:
+                continue
+            cell = item.grid_cell()
+            if cell in covered_cells:
+                continue  # already covered by a region's own confirmed point at this cell
+            points.append((None, item.fit.row, item.fit.col, item.z))
+            covered_cells.add(cell)
+
+        return points
+
+    def _is_manually_force_excluded(self, region_id: int | None, grid_cell: tuple[int, int]) -> bool:
+        """Unlike _is_region_point_excluded/_is_global_point_excluded (which
+        also fold in the automatic RANSAC outlier flag), this checks ONLY an
+        explicit manual override - used to decide what's fed into a FRESH
+        RANSAC fit itself, so a point a PRIOR fit flagged as an outlier still
+        gets reconsidered each time rather than being permanently locked out."""
+        override = (
+            self.global_inclusion_override.get(grid_cell) if region_id is None
+            else self.region_inclusion_override.get(region_id, {}).get(grid_cell)
+        )
+        return override is False
+
     def _on_fit_global_plane_clicked(self):
-        if len(self.global_focus_points) < 3:
+        gathered = self._gather_global_focus_points()
+        if len(gathered) < 3:
             QMessageBox.information(
                 self, "Global Focus Search",
-                "Run and confirm the global focus search first (need at least 3 confirmed points).",
+                "Need at least 3 confirmed focus points to fit a plane - run autofocus for some regions "
+                "and/or confirm a Global Focus Search first.",
             )
             return
 
-        # A manually force-excluded point (shift-click -> Exclude) is kept out of
-        # the RANSAC input entirely, not just hidden from the result - it
-        # shouldn't get to skew the fitted plane's math either. A force-included
-        # point stays in the input as normal; _is_global_point_excluded is what
-        # makes sure it's still reported as included below even if RANSAC's own
-        # classifier happens to flag it.
+        # A manually force-excluded point (from either a region's or the
+        # global plane review dialog) is kept out of the RANSAC input
+        # entirely, not just hidden from the result - it shouldn't get to skew
+        # the fitted plane's math either. Everything else - including a point
+        # a PRIOR fit flagged as an outlier - stays in the input, so RANSAC
+        # gets to reconsider it fresh each time;
+        # _is_region_point_excluded/_is_global_point_excluded (used below, and
+        # for canvas visuals) are what fold that flag back in afterward.
         input_points = [
-            (row, col, z) for row, col, z in self.global_focus_points
-            if self.global_inclusion_override.get((int(round(row)), int(round(col)))) is not False
+            (row, col, z) for region_id, row, col, z in gathered
+            if not self._is_manually_force_excluded(region_id, (int(round(row)), int(round(col))))
         ]
         if len(input_points) < 3:
             QMessageBox.warning(
@@ -1083,6 +1160,7 @@ class RegionDesignerWindow(QMainWindow):
             QMessageBox.warning(self, "Global Focus Search", str(e))
             return
 
+        self.global_focus_points = [(row, col, z) for _region_id, row, col, z in gathered]
         self.global_plane = plane
         inlier_mask = plane.inlier_mask()
         self.global_outlier_sections = {
@@ -1095,11 +1173,14 @@ class RegionDesignerWindow(QMainWindow):
 
         residuals = plane.residuals()
         excluded_count = sum(
-            1 for row, col, _z in self.global_focus_points
-            if self._is_global_point_excluded((int(round(row)), int(round(col))))
+            1 for region_id, row, col, _z in gathered
+            if (
+                self._is_global_point_excluded((int(round(row)), int(round(col)))) if region_id is None
+                else self._is_region_point_excluded(region_id, (int(round(row)), int(round(col))))
+            )
         )
         self.status_label.setText(
-            f"Global RANSAC plane: {len(input_points)} point(s) fit, "
+            f"Global RANSAC plane: {len(input_points)} point(s) fit ({len(gathered)} total known), "
             f"{excluded_count} excluded overall, max residual = {max(residuals):.4f}mm."
         )
 
@@ -1130,48 +1211,121 @@ class RegionDesignerWindow(QMainWindow):
         for item in self.canvas.focus_point_items:
             item.set_excluded(self._is_region_point_excluded(item.region_id, item.grid_cell()))
 
+    # ---- Plane fit review (list-based, styled like FocusReviewDialog) ----
     def _on_focus_point_shift_clicked(self, item):
-        """Opens a small plot+toggle popup for one already-fitted focus point
-        (region or global) - see canvas_view.SectionCanvas.focusPointShiftClicked
-        and focus_point_inspector.FocusPointInspectorDialog."""
-        if item.fit is None:
-            QMessageBox.information(
-                self, "Focus Point", "This point hasn't completed an autofocus sweep yet - nothing to review.",
-            )
-            return
+        """Shift+click a marker - opens the plane review dialog scoped to that
+        point's own group (its region's points, or the global set for a global
+        point), pre-selected to it. See canvas_view.SectionCanvas.
+        focusPointShiftClicked and plane_fit_review_dialog.PlaneFitReviewDialog."""
+        if item.region_id is None:
+            group = list(self.canvas.global_focus_point_items)
+            title = "Review Plane Fit - Global Focus Search"
+        else:
+            group = [it for it in self.canvas.focus_point_items if it.region_id == item.region_id]
+            title = f"Review Plane Fit - Region {item.region_id}"
+        self._open_plane_review_dialog(group, title, preselect=item)
 
+    def _on_review_region_plane_fit_clicked(self):
+        region_id = self.region_id_spin.value()
+        group = [it for it in self.canvas.focus_point_items if it.region_id == region_id]
+        self._open_plane_review_dialog(group, f"Review Plane Fit - Region {region_id}")
+
+    def _on_review_global_plane_fit_clicked(self):
+        # _global_af_items is whatever point set the last Global Focus Search
+        # actually ran on - region points reused by the one-click button, or a
+        # dedicated global set - which is exactly what the global RANSAC plane
+        # was fit over. Falls back to a freshly-placed-but-not-yet-searched
+        # global set so it's still something to look at (just with nothing to
+        # plot per point yet).
+        group = self._global_af_items or list(self.canvas.global_focus_point_items)
+        self._open_plane_review_dialog(group, "Review Plane Fit - Global Focus Search")
+
+    def _open_plane_review_dialog(self, items: list, title: str, preselect=None):
+        if not items:
+            QMessageBox.information(self, "Review Plane Fit", "No focus points to review yet.")
+            return
+        if self._plane_review_dialog is not None:
+            self._plane_review_dialog.close()  # replace any dialog already open, re-scoped to this group
+
+        dialog = PlaneFitReviewDialog(
+            title, items,
+            get_info=self._plane_review_info,
+            on_toggle=self._on_plane_review_toggle,
+            on_selection_changed=self._on_plane_review_selection_changed,
+            parent=self,
+        )
+        dialog.finished.connect(lambda _result, d=dialog: self._on_plane_review_dialog_finished(d))
+        self._plane_review_dialog = dialog
+        dialog.show()
+        if preselect is not None:
+            dialog.select_item(preselect)
+
+    def _on_plane_review_dialog_finished(self, dialog: "PlaneFitReviewDialog"):
+        if self._plane_review_dialog is dialog:
+            self._plane_review_dialog = None
+
+    def _plane_review_info(self, item) -> dict:
+        """get_info callback for PlaneFitReviewDialog - see its docstring for
+        the expected keys."""
+        is_global = item.region_id is None
+        grid_cell = item.grid_cell()
+        excluded = (
+            self._is_global_point_excluded(grid_cell) if is_global
+            else self._is_region_point_excluded(item.region_id, grid_cell)
+        )
+        row, col = item.section()
+        label = f"[{'EXCL' if excluded else 'OK'}] ({row:.1f}, {col:.1f})"
+
+        if item.fit is None:
+            return {
+                "label": label, "excluded": excluded, "fit": None,
+                "unavailable": "This point hasn't completed an autofocus sweep yet.",
+            }
+
+        # The plane actually in effect for this point right now - the global
+        # RANSAC plane for a global point, or this region's own last Fit Region
+        # Plane result - so the dialog can show how far its chosen Z sits from
+        # what that plane predicts. None if that plane hasn't been fit yet (or
+        # was invalidated by a later reconfirm).
+        plane = self.global_plane if is_global else self.region_planes.get(item.region_id)
+        plane_z = plane.z_at(item.fit.row, item.fit.col) if plane is not None else None
+        return {"label": label, "excluded": excluded, "fit": item.fit, "z": item.z, "plane_z": plane_z}
+
+    def _on_plane_review_toggle(self, item):
         grid_cell = item.grid_cell()
         is_global = item.region_id is None
         currently_excluded = (
             self._is_global_point_excluded(grid_cell) if is_global
             else self._is_region_point_excluded(item.region_id, grid_cell)
         )
-
-        # The plane that's actually in effect for this point right now - the
-        # global RANSAC plane for a global point, or this region's own last Fit
-        # Region Plane result - so the dialog can show how far the point's
-        # chosen Z sits from what that plane would predict here. None if that
-        # plane hasn't been fit yet (or was invalidated by a later reconfirm).
-        plane = self.global_plane if is_global else self.region_planes.get(item.region_id)
-        plane_z = plane.z_at(item.fit.row, item.fit.col) if plane is not None else None
-
-        dialog = FocusPointInspectorDialog(item.fit, item.z, currently_excluded, plane_z=plane_z, parent=self)
-        dialog.exec()
-
-        if dialog.result_excluded == currently_excluded:
-            return  # closed without toggling - nothing to update
-
-        override_value = not dialog.result_excluded  # True = force included, False = force excluded
+        # Flips the effective state: the dict stores "force included" (True) /
+        # "force excluded" (False), so the new override is just the OLD
+        # excluded flag itself (excluded=True -> force include=True, and vice
+        # versa).
+        override_value = currently_excluded
         if is_global:
             self.global_inclusion_override[grid_cell] = override_value
         else:
             self.region_inclusion_override.setdefault(item.region_id, {})[grid_cell] = override_value
 
         self._refresh_focus_point_exclusion_visuals()
+        if self._plane_review_dialog is not None:
+            self._plane_review_dialog.refresh()
         self.status_label.setText(
             f"Focus point ({grid_cell[0]}, {grid_cell[1]}): "
-            f"{'excluded from' if dialog.result_excluded else 'included in'} plane fitting."
+            f"{'included in' if override_value else 'excluded from'} plane fitting."
         )
+
+    def _on_plane_review_selection_changed(self, item):
+        """Highlights the newly selected point's marker in red (see
+        focus_point_item.FocusPointItem.set_highlighted) and un-highlights
+        whatever was selected before, so exactly one marker (or none) is ever
+        highlighted - including when the dialog closes (item=None)."""
+        if self._plane_review_highlighted_item is not None and self._plane_review_highlighted_item is not item:
+            self._plane_review_highlighted_item.set_highlighted(False)
+        if item is not None:
+            item.set_highlighted(True)
+        self._plane_review_highlighted_item = item
 
     def _focus_points_locked(self) -> bool:
         """True while adding/removing a focus point could land in the middle of
