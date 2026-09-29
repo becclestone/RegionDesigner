@@ -6,7 +6,7 @@ import grid_geometry as geom
 from region_colors import region_color
 
 _RADIUS_PX = 3.0
-_FILL_COLOR = QColor(255, 255, 255, 120)
+_FILL_COLOR = QColor(255, 255, 255, 255)
 _BORDER_WIDTH = 2.0
 _BORDER_ALPHA = 150
 
@@ -14,9 +14,9 @@ _BORDER_ALPHA = 150
 # sweeps through a region's points, so progress is visible point-by-point rather
 # than only once the whole region's sequence finishes.
 _STATUS_FILL_COLORS = {
-    "focusing": QColor(255, 210, 40, 210),
-    "done": QColor(80, 230, 120, 210),
-    "failed": QColor(230, 70, 70, 210),
+    "focusing": QColor(255, 210, 40, 255),
+    "done": QColor(80, 230, 120, 255),
+    "failed": QColor(230, 70, 70, 255),
 }
 
 # Drawn instead of the status color above whenever main_window considers this
@@ -24,7 +24,7 @@ _STATUS_FILL_COLORS = {
 # own RANSAC outlier flag, or a manual override set via shift-click (see
 # FocusPointInspectorDialog) - so "excluded" always looks the same regardless
 # of why, and always wins over "done"/"failed".
-_EXCLUDED_FILL_COLOR = QColor(90, 90, 90, 220)
+_EXCLUDED_FILL_COLOR = QColor(90, 90, 90, 255)
 
 # Global focus points (region_id=None - not tied to any one compiled region,
 # see main_window's Global Focus Search controls) get a fixed neutral border

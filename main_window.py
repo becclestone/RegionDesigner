@@ -837,12 +837,17 @@ class RegionDesignerWindow(QMainWindow):
 
     # ---- Global Focus Search (second fitting mode) ----
     def _on_run_global_focus_plane_fitting_clicked(self):
-        """One-click chain of Place Global Focus Points (skipped if points are
-        already placed - reuses that set) -> Run Global Focus Search -> Fit
-        Global RANSAC Plane, the last step firing automatically once the
-        operator confirms the search (see _on_global_review_dialog_finished).
-        Doesn't care whether Compile Regions has run yet - safe to press
-        before or after."""
+        """One-click chain of Run Global Focus Search -> Fit Global RANSAC
+        Plane, the last step firing automatically once the operator confirms
+        the search (see _on_global_review_dialog_finished).
+
+        If Compile Regions has already placed per-region focus points, THOSE
+        are reused as the point set (across every region at once) rather than
+        computing an independent whole-sample distribution - the operator
+        already chose those positions, and a second, differently-placed set
+        would just be redundant. Only when no region points exist yet (e.g.
+        run before Compile Regions) does this fall back to placing a dedicated
+        set of global points itself."""
         if self.calibration is None:
             QMessageBox.warning(self, "Global Focus Search", "Load a calibration file first.")
             return
@@ -850,13 +855,17 @@ class RegionDesignerWindow(QMainWindow):
             QMessageBox.warning(self, "Global Focus Search", "Another hardware operation is already in progress.")
             return
 
-        if not self.canvas.global_focus_point_items:
-            self._on_place_global_focus_points_clicked()
+        if self.canvas.focus_point_items:
+            items = list(self.canvas.focus_point_items)
+        else:
             if not self.canvas.global_focus_point_items:
+                self._on_place_global_focus_points_clicked()
+            items = list(self.canvas.global_focus_point_items)
+            if not items:
                 return  # nothing painted yet - _on_place_global_focus_points_clicked already warned
 
         self._global_auto_fit_after_search = True
-        self._on_run_global_focus_search_clicked()
+        self._run_global_focus_search(items)
 
     def _on_place_global_focus_points_clicked(self):
         sections = list(self.canvas.painted)
@@ -882,19 +891,29 @@ class RegionDesignerWindow(QMainWindow):
         )
 
     def _on_run_global_focus_search_clicked(self):
+        """Manual 'Run Global Focus Search' button - always operates on the
+        dedicated global point set (Place Global Focus Points), unlike the
+        one-click 'Run Global Focus Plane Fitting' button above, which prefers
+        reusing region points when they exist. Use this one when you
+        specifically want a standalone global sweep instead."""
         if self.calibration is None:
             QMessageBox.warning(self, "Global Focus Search", "Load a calibration file first.")
             return
         if self.bridge.is_busy():
             QMessageBox.warning(self, "Global Focus Search", "Another hardware operation is already in progress.")
             return
-
-        points = self.canvas.global_focus_points()
-        if not points:
+        if not self.canvas.global_focus_point_items:
             QMessageBox.information(self, "Global Focus Search", "Place global focus points first.")
             return
+        self._run_global_focus_search(list(self.canvas.global_focus_point_items))
 
-        items = list(self.canvas.global_focus_point_items)
+    def _run_global_focus_search(self, items: list):
+        """Runs autofocus over `items` (any mix of region-owned and/or global
+        FocusPointItems), then opens the review dialog to confirm them - shared
+        by the manual 'Run Global Focus Search' button and the one-click 'Run
+        Global Focus Plane Fitting' button, which differ only in which items
+        they pass in."""
+        points = [item.section() for item in items]
         for item in items:
             item.set_status(None)
 
@@ -960,11 +979,10 @@ class RegionDesignerWindow(QMainWindow):
 
         confirmed = bool(dialog.fits) and result == FocusReviewDialog.DialogCode.Accepted
         if confirmed:
-            self.global_focus_points = dialog.result_focus_points()
             # Fresh confirmation - the prior manual include/exclude overrides no
             # longer necessarily apply to the same points.
             self.global_inclusion_override = {}
-            self._record_confirmed_z(list(self.canvas.global_focus_point_items), dialog)
+            self._apply_global_search_results(self._global_af_items, dialog)
             self.status_label.setText(
                 f"Global focus search: {len(self.global_focus_points)} point(s) confirmed"
                 + ("" if auto_fit else " - run 'Fit Global RANSAC Plane / Find Outliers' next.")
@@ -981,6 +999,41 @@ class RegionDesignerWindow(QMainWindow):
 
         if auto_fit and confirmed:
             self._on_fit_global_plane_clicked()
+
+    def _apply_global_search_results(self, items: list, dialog: FocusReviewDialog):
+        """Common tail of a confirmed Global Focus Search run, whatever its
+        point set was - already-placed region focus points reused by
+        _on_run_global_focus_plane_fitting_clicked, or a dedicated whole-sample
+        set from Place Global Focus Points. Matches each of dialog.fits back to
+        the marker it came from by object identity (the same FocusFit set on
+        item.fit when its sweep completed - see _on_global_af_point_fitted),
+        records its confirmed Z there, and:
+        - for any region-owned point, feeds that region's own confirmed points
+          straight back into region_focus_points - so Fit Region Plane can use
+          them right away, without a separate per-region autofocus pass just to
+          populate that dict - and clears its stale plane/manual overrides,
+          same as a normal per-region confirmation would.
+        - builds self.global_focus_points as the full combined set (every
+          region's points together, plus any dedicated global ones) for
+          _on_fit_global_plane_clicked's RANSAC fit to run over."""
+        fit_id_to_item = {id(it.fit): it for it in items if it.fit is not None}
+        by_region: dict[int | None, list[tuple[float, float, float]]] = {}
+        for i, fit in enumerate(dialog.fits):
+            item = fit_id_to_item.get(id(fit))
+            z = dialog.confirmed_z.get(i)
+            if item is None or z is None:
+                continue
+            item.z = z
+            by_region.setdefault(item.region_id, []).append((fit.row, fit.col, z))
+
+        for region_id, points in by_region.items():
+            if region_id is None:
+                continue
+            self.region_focus_points[region_id] = points
+            self.region_inclusion_override[region_id] = {}
+            self.region_planes.pop(region_id, None)
+
+        self.global_focus_points = [pt for points in by_region.values() for pt in points]
 
     @staticmethod
     def _record_confirmed_z(items: list, dialog: FocusReviewDialog):
