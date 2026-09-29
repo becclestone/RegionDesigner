@@ -14,6 +14,7 @@ import autofocus_log
 import region_clustering as clustering
 import scan_archive
 import scan_finalize
+import session_state
 from stage_calibration import StageCalibration
 from autofocus_client import AutofocusSequenceWorker
 from focus_review_dialog import FocusReviewDialog
@@ -139,6 +140,11 @@ class RegionDesignerWindow(QMainWindow):
         self._scanning_region_id: int | None = None
         self._scan_existing_run_folders: set[str] = set()
         self._aggregate_root: str | None = None
+        # Last snap image path (see _on_image_ready) - saved into session.json
+        # as a best-effort visual reference for "Open Previous Scan...", since
+        # a snap always comes from live hardware and there's no other way to
+        # get the same background back after a restart.
+        self._last_snap_path: str | None = None
         # One entry per region scan whose output is still being archived (or is
         # eligible to be, once its aggregate batch is known) - see
         # _start_region_scan/_on_region_scan_finished/_on_section_reconstructing/
@@ -353,7 +359,11 @@ class RegionDesignerWindow(QMainWindow):
         self.open_previous_scan_btn.setToolTip(
             "Picks an existing <timestamp>_aggregate folder under IMAGES_ROOT and makes it the active "
             "aggregate batch again, so further scanning/archiving or Finalize Results can resume "
-            "targeting it. Does not restore the canvas's painted regions/focus points."
+            "targeting it. If it has a saved session.json (written automatically at Compile Regions/"
+            "confirm/Start New Aggregate Batch), also restores the canvas's painted regions and confirmed "
+            "focus points, and marks any region a hardware failure interrupted partway through its scan "
+            "as \"partial\" so Scan Region can resume just its missing sections. Older batches without a "
+            "saved session.json only get the aggregate-batch retarget, same as before."
         )
         self.open_previous_scan_btn.clicked.connect(self._on_open_previous_scan_clicked)
         toolbar2.addWidget(self.open_previous_scan_btn)
@@ -489,6 +499,7 @@ class RegionDesignerWindow(QMainWindow):
 
     def _on_image_ready(self, image_path: str):
         self.canvas.set_background_image(image_path)
+        self._last_snap_path = image_path
 
     def _on_command_error(self, message: str):
         QMessageBox.warning(self, "Controller error", message)
@@ -571,6 +582,7 @@ class RegionDesignerWindow(QMainWindow):
         self.region_id_spin.setValue(0)
         self.canvas.set_active_region(0)
         self._refresh_focus_point_exclusion_visuals()
+        self._save_session()
 
     def _on_clear_regions_clicked(self):
         self.canvas.clear_regions()
@@ -638,6 +650,23 @@ class RegionDesignerWindow(QMainWindow):
         self.region_id_spin.setValue(0)
         self.status_label.setText("Reset - ready for a new scan.")
 
+    def _save_session(self):
+        """Checkpoint save of the current region design (see session_state.py's
+        module docstring for exactly what is/isn't persisted) into the active
+        aggregate batch - no-op until one exists. Called after every step that
+        changes something session_state.save_session actually persists, so a
+        crash any time after that step still leaves a reloadable batch."""
+        if self._aggregate_root is None:
+            return
+        session_state.save_session(
+            self._aggregate_root,
+            painted=self.canvas.painted,
+            region_of=self.canvas.region_of,
+            region_focus_points=self.region_focus_points,
+            region_inclusion_override=self.region_inclusion_override,
+            background_image_path=self._last_snap_path,
+        )
+
     def _on_open_previous_scan_clicked(self):
         path = QFileDialog.getExistingDirectory(
             self, "Select a previous aggregate batch folder", confirmation_scan.IMAGES_ROOT,
@@ -645,11 +674,99 @@ class RegionDesignerWindow(QMainWindow):
         if not path:
             return
         self._aggregate_root = path
-        self.status_label.setText(f"Aggregate batch set to: {os.path.basename(path)}")
+        session = session_state.load_session(path)
+        if session is None:
+            self.status_label.setText(
+                f"Aggregate batch set to: {os.path.basename(path)} (no saved region design found in it - "
+                f"painted regions/focus points were not restored)."
+            )
+            return
+        num_regions, num_sections = self._apply_loaded_session(session)
+        self.status_label.setText(
+            f"Aggregate batch reloaded: {os.path.basename(path)} - restored {num_sections} section(s) "
+            f"across {num_regions} region(s). A region already fully scanned shows \"scanned\"; a region "
+            f"scanned only partway through before shows \"partial\" and can be resumed with Scan Region."
+        )
+
+    def _apply_loaded_session(self, session: dict) -> tuple[int, int]:
+        """Repopulates the canvas/region state from a previously saved
+        session.json (see _on_open_previous_scan_clicked). Returns (number of
+        regions, number of sections) restored, for the status message."""
+        self.canvas.reset()
+
+        region_of = {(row, col): region_id for row, col, region_id in session["region_of"]}
+        self.canvas.painted = {(row, col) for row, col in session["painted"]}
+        self.canvas.apply_regions(region_of)
+
+        self.region_focus_points = {}
+        for region_id, row, col, z in session["region_focus_points"]:
+            self.region_focus_points.setdefault(region_id, []).append((row, col, z))
+
+        self.region_inclusion_override = {}
+        for region_id, row, col, included in session["region_inclusion_override"]:
+            self.region_inclusion_override.setdefault(region_id, {})[(row, col)] = included
+
+        for region_id, points in self.region_focus_points.items():
+            for row, col, _z in points:
+                self.canvas.add_focus_point(region_id, row, col)
+
+        background_image_path = session.get("background_image_path")
+        if background_image_path and os.path.isfile(background_image_path):
+            try:
+                self.canvas.set_background_image(background_image_path)
+                self._last_snap_path = background_image_path
+            except Exception:
+                pass  # non-critical - operator can Snap again for a fresh reference image
+
+        region_ids = sorted(set(region_of.values()))
+        if region_ids:
+            self.region_id_spin.setMaximum(max(region_ids))
+            self.region_id_spin.setValue(region_ids[0])
+            self.canvas.set_active_region(region_ids[0])
+
+        for region_id in region_ids:
+            self._restore_region_status(region_id, region_of)
+
+        return len(region_ids), len(region_of)
+
+    def _restore_region_status(self, region_id: int, region_of: dict[tuple[int, int], int]):
+        """Recomputes region_planes/section_z (from region_focus_points, via
+        the same _fit_plane_for_region a manual Fit Region Plane click uses)
+        and this region's status - always from what's actually on disk under
+        the aggregate root, never from anything saved, so a stale save can
+        never claim more progress than really happened. See
+        session_state.completed_master_sections."""
+        focus_points = self.region_focus_points.get(region_id)
+        if focus_points and len(focus_points) >= 3:
+            self._fit_plane_for_region(region_id)
+
+        status = "confirmed" if focus_points else None
+        if self._aggregate_root is not None:
+            scan_data_dir = os.path.join(self._aggregate_root, f"Region_{region_id}", "Scan_data")
+            if os.path.isdir(scan_data_dir) and self.calibration is not None:
+                region_sections = [s for s, rid in region_of.items() if rid == region_id]
+                done_master = session_state.completed_master_sections(scan_data_dir)
+                expected_master = {
+                    (int(round(self.calibration.offset_row + row)), int(round(self.calibration.offset_col + col)))
+                    for row, col in region_sections
+                }
+                done_count = len(expected_master & done_master)
+                if expected_master and done_count == len(expected_master):
+                    status = "scanned"
+                else:
+                    status = "partial"
+                    self.canvas.set_region_progress(region_id, done_count, len(expected_master))
+            elif os.path.isdir(scan_data_dir):
+                # Scan_data exists but no calibration loaded yet to convert to
+                # master-grid coordinates - can't tell what's done, so don't
+                # guess; leave it "confirmed" until calibration is available.
+                pass
+        self.canvas.set_region_status(region_id, status)
 
     def _on_start_aggregate_clicked(self):
         self._aggregate_root = scan_archive.start_new_aggregate_batch()
         self.status_label.setText(f"New aggregate batch: {os.path.basename(self._aggregate_root)}")
+        self._save_session()
 
     def _on_finalize_results_clicked(self):
         if self._aggregate_root is None:
@@ -832,6 +949,7 @@ class RegionDesignerWindow(QMainWindow):
                         scan_archive.archive_focus_point(self._aggregate_root, region_id, focus_index, captures)
                 if self._af_log_path is not None:
                     scan_archive.archive_autofocus_log(self._aggregate_root, region_id, self._af_log_path)
+            self._save_session()
         else:
             # Operator declined the fit (or closed the dialog) - go back to
             # unmarked/pending so a retry is unambiguous.
@@ -1468,14 +1586,48 @@ class RegionDesignerWindow(QMainWindow):
         ordered_sections = clustering.serpentine_order(region_sections)
         sections_with_z = [(row, col, self.section_z[(row, col)]) for row, col in ordered_sections]
 
+        # Resume support: if this region already has a Scan_data folder in the
+        # active aggregate batch (from a prior session that got interrupted by
+        # a hardware failure - see _apply_loaded_session/_restore_region_status),
+        # drop whichever sections already have their NR image on disk and only
+        # resubmit what's actually missing. The new (smaller) run folder still
+        # archives into that same Scan_data/ folder alongside the earlier one -
+        # scan_finalize.finalize_aggregate already merges every run folder
+        # found there, so nothing else needs to change for that to work.
+        num_already_done = 0
+        if self._aggregate_root is not None and self.calibration is not None:
+            scan_data_dir = os.path.join(self._aggregate_root, f"Region_{region_id}", "Scan_data")
+            done_master = session_state.completed_master_sections(scan_data_dir)
+            if done_master:
+                remaining = [
+                    (row, col, z) for row, col, z in sections_with_z
+                    if (int(round(self.calibration.offset_row + row)), int(round(self.calibration.offset_col + col)))
+                    not in done_master
+                ]
+                num_already_done = len(sections_with_z) - len(remaining)
+                sections_with_z = remaining
+
+        if num_already_done and not sections_with_z:
+            self.canvas.set_region_status(region_id, "scanned")
+            self.status_label.setText(
+                f"Region {region_id}: already fully scanned in this aggregate batch - nothing to resume."
+            )
+            return False
+
         if confirm:
+            resume_note = (
+                f"\n\n{num_already_done} of {num_already_done + len(sections_with_z)} section(s) were already "
+                f"scanned in a previous session - only the remaining {len(sections_with_z)} will be scanned now."
+                if num_already_done else ""
+            )
             reply = QMessageBox.question(
                 self, "Scan Region",
                 f"Scan region {region_id} now? This submits a real {len(sections_with_z)}-section scan to the "
                 f"controller - the stage will move for real.\n\n"
                 f"Note: this scan is open-loop (drives straight to the Fit Region Plane Z, no live refocus), "
                 f"unlike DOVER_UI's own Image-Path Scan button which live-autofocuses during the scan - so "
-                f"results can look softer if the plane fit didn't perfectly capture the tissue's tilt/drift.",
+                f"results can look softer if the plane fit didn't perfectly capture the tissue's tilt/drift."
+                f"{resume_note}",
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return False
@@ -1699,6 +1851,7 @@ class RegionDesignerWindow(QMainWindow):
         if self._aggregate_root is None:
             self._aggregate_root = scan_archive.start_new_aggregate_batch()
             self.status_label.setText(f"New aggregate batch: {os.path.basename(self._aggregate_root)}")
+            self._save_session()
 
         self._auto_pipeline_active = True
         self._auto_pipeline_region_ids = region_ids

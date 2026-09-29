@@ -74,6 +74,12 @@ _STATUS_FILL_COLORS = {
     "failed": QColor(230, 60, 60, 55),
     "scanning": QColor(60, 140, 220, 45),
     "scanned": QColor(30, 160, 160, 50),
+    # Reloaded from a previous aggregate batch (see main_window._restore_region_status)
+    # whose Scan_data folder has some, but not all, of this region's sections'
+    # NR images on disk yet - a hardware failure interrupted its scan partway
+    # through. Distinct purple so it doesn't get confused with "scanning"
+    # (blue, actively in flight right now) or "failed" (red).
+    "partial": QColor(160, 90, 220, 50),
 }
 _STATUS_LABEL_BG_COLORS = {
     "focusing": QColor(200, 140, 0, 220),
@@ -81,6 +87,7 @@ _STATUS_LABEL_BG_COLORS = {
     "failed": QColor(180, 40, 40, 220),
     "scanning": QColor(30, 90, 170, 220),
     "scanned": QColor(20, 110, 110, 220),
+    "partial": QColor(110, 50, 170, 220),
 }
 
 # Live per-section scan/reconstruction overlay (see SectionCanvas.section_activity
@@ -543,6 +550,10 @@ class SectionCanvas(QGraphicsView):
             text = f"{region_id} (scanning)"
         elif status == "scanned":
             text = f"{region_id} (scanned)"
+        elif status == "partial" and progress is not None:
+            text = f"{region_id} ({progress[0]}/{progress[1]} scanned - resume)"
+        elif status == "partial":
+            text = f"{region_id} (partial)"
         else:
             text = str(region_id)
         font = QFont()
