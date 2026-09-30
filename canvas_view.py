@@ -760,6 +760,22 @@ class SectionCanvas(QGraphicsView):
         focus_points_by_region()."""
         return [item.section() for item in self.global_focus_point_items]
 
+    def assign_new_region(self, sections: set[Section]) -> int:
+        """Carves a brand-new region out of an arbitrary sub-selection of already-
+        painted sections (see main_window's 'Create Region from Marked Sections') -
+        unlike Compile Regions, this leaves every other existing region's
+        membership untouched; a section reassigned here just moves out of
+        whatever region (if any) it belonged to before. Returns the new region's
+        id: one past the current highest region id (0 if there are none yet -
+        same 0-based convention region_clustering.assign_regions uses)."""
+        new_region_id = (max(self.region_of.values()) + 1) if self.region_of else 0
+        for section in sections:
+            self.region_of[section] = new_region_id
+            self.redo_sections.discard(section)
+        self.draw_mode = False
+        self._redraw_mask()
+        return new_region_id
+
     # ---- redo/correction (post-hoc) ----
     def set_redo_mode(self, enabled: bool):
         self.redo_mode = enabled

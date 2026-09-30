@@ -592,12 +592,27 @@ class RegionDesignerWindow(QMainWindow):
         toolbar4.addWidget(clear_redo_marks_btn)
 
         toolbar4.addSeparator()
+        toolbar4.addWidget(QLabel(" Then either: "))
+
+        self.create_region_from_marks_btn = QPushButton("Create Region from Marked Sections")
+        self.create_region_from_marks_btn.setToolTip(
+            "For a more accurate redo than one flat Z: carves the marked sections out into a brand-new "
+            "region (its own id, selected automatically below) - double-click within it to place several "
+            "focus points by hand, then use Run Autofocus for Region / Fit Region Plane / Scan Region on "
+            "it exactly like any compiled region, with a proper per-section plane-fit Z. Clears the marks "
+            "and turns off 'Mark Sections for Redo' once created."
+        )
+        self.create_region_from_marks_btn.clicked.connect(self._on_create_region_from_marks_clicked)
+        toolbar4.addWidget(self.create_region_from_marks_btn)
+
+        toolbar4.addWidget(QLabel(" or: "))
 
         self.pick_redo_focus_btn = QPushButton("Set Redo Focus Point")
         self.pick_redo_focus_btn.setCheckable(True)
         self.pick_redo_focus_btn.setToolTip(
-            "While active, click anywhere on the canvas to place (or move) the single focus point used "
-            "to focus every section currently marked for redo. Right-click it to remove it."
+            "Quick path: one flat Z for every marked section. While active, click anywhere on the canvas "
+            "to place (or move) the single focus point used to focus all of them. Right-click it to "
+            "remove it."
         )
         self.pick_redo_focus_btn.toggled.connect(self.canvas.set_pick_redo_focus_mode)
         toolbar4.addWidget(self.pick_redo_focus_btn)
@@ -2314,6 +2329,23 @@ class RegionDesignerWindow(QMainWindow):
         self._redo_af_item = None
         self._redo_confirmed_z = None
         self.status_label.setText("Redo focus point removed.")
+
+    def _on_create_region_from_marks_clicked(self):
+        if not self.canvas.redo_sections:
+            QMessageBox.information(
+                self, "Create Region", "Mark at least one section (via 'Mark Sections for Redo') first.",
+            )
+            return
+        count = len(self.canvas.redo_sections)
+        region_id = self.canvas.assign_new_region(self.canvas.redo_sections)
+        self.mark_redo_btn.setChecked(False)  # done marking - avoid a stray toggle re-marking sections
+        self.region_id_spin.setMaximum(max(self.region_id_spin.maximum(), region_id))
+        self.region_id_spin.setValue(region_id)
+        self.canvas.set_active_region(region_id)
+        self.status_label.setText(
+            f"Created region {region_id} from {count} marked section(s) - double-click within it to add "
+            f"focus points, then Run Autofocus for Region to focus and confirm them."
+        )
 
     def _on_run_redo_autofocus_clicked(self):
         if self.calibration is None:
