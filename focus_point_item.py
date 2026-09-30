@@ -132,3 +132,8 @@ class FocusPointItem(QGraphicsEllipseItem):
             self._row, self._col = geom.point_to_section_center_f(
                 value.x(), value.y(), self.canvas.anchor, self.canvas.zoom)
         return super().itemChange(change, value)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self.canvas.snap_focus_points_on_release:
+            self.snap_to_grid()

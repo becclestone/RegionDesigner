@@ -244,6 +244,16 @@ class RegionDesignerWindow(QMainWindow):
         snap_focus_points_btn.clicked.connect(self._on_snap_focus_points_clicked)
         toolbar.addWidget(snap_focus_points_btn)
 
+        self.snap_focus_points_on_release_check = QCheckBox("Snap on Drag")
+        self.snap_focus_points_on_release_check.setToolTip(
+            "While checked, releasing a dragged focus point immediately snaps it "
+            "to the exact center of its nearest section."
+        )
+        self.snap_focus_points_on_release_check.toggled.connect(
+            self.canvas.set_snap_focus_points_on_release
+        )
+        toolbar.addWidget(self.snap_focus_points_on_release_check)
+
         toolbar.addSeparator()
 
         load_cal_btn = QPushButton("Load Calibration...")

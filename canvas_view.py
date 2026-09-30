@@ -148,6 +148,7 @@ class SectionCanvas(QGraphicsView):
         self.region_progress: dict[int, tuple[int, int]] = {}  # region_id -> (points done, total)
         self.section_activity: dict[Section, str] = {}  # (row,col) -> "scanning" | "reconstructing" | "reconstructed"
         self.show_grid = False  # overlay of section-grid lines, toggled from the toolbar
+        self.snap_focus_points_on_release = False  # see set_snap_focus_points_on_release
 
         self.brush_radius = 4  # radius in section-width units (true circular radius in scene pixels)
         self._painting = False
@@ -527,6 +528,12 @@ class SectionCanvas(QGraphicsView):
         self.show_grid = show
         if self.mask_image is not None:
             self._redraw_mask()
+
+    def set_snap_focus_points_on_release(self, enabled: bool):
+        """Toggled from the toolbar checkbox - while enabled, releasing a dragged
+        focus point (see FocusPointItem.mouseReleaseEvent) immediately snaps it
+        back to its nearest section center instead of leaving it free-form."""
+        self.snap_focus_points_on_release = enabled
 
     def _draw_region_label(
         self, painter: QPainter, region_id: int, cx: float, cy: float,
