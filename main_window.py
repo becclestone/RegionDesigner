@@ -1022,7 +1022,7 @@ class RegionDesignerWindow(QMainWindow):
 
         try:
             num_sections = scan_path_export.export_scan_path(
-                out_path, self.canvas.region_of, self.region_focus_points,
+                out_path, self.canvas.region_of, self._focus_points_excluding_flagged(),
             )
         except ValueError as e:
             QMessageBox.warning(self, "Export Scan Path", str(e))
@@ -1048,7 +1048,7 @@ class RegionDesignerWindow(QMainWindow):
             return
 
         try:
-            rows = scan_path_export.build_scan_path(self.canvas.region_of, self.region_focus_points)
+            rows = scan_path_export.build_scan_path(self.canvas.region_of, self._focus_points_excluding_flagged())
         except ValueError as e:
             QMessageBox.warning(self, "Send Scan Path", str(e))
             return
@@ -1733,6 +1733,23 @@ class RegionDesignerWindow(QMainWindow):
         self.status_label.setText("Cleared global focus points.")
 
     # ---- shared exclusion logic (Global Focus Search RANSAC flag + manual override) ----
+    def _focus_points_excluding_flagged(self) -> dict[int, list[tuple[float, float, float]]]:
+        """self.region_focus_points, minus any point _is_region_point_excluded currently
+        considers excluded (a manual shift-click override, or - if the checkbox is on - a
+        Global Focus Search RANSAC outlier flag). Same predicate _fit_plane_for_region
+        already applies before fitting a region's plane; scan_path_export.build_scan_path/
+        export_scan_path take region_focus_points as a plain, unfiltered dict, so a
+        caller building a scan path to export or send to the controller must pass this
+        filtered view instead, or an untrustworthy point kept out of the plane fit would
+        still end up as a donor/focus location in the scan itself."""
+        return {
+            region_id: [
+                (row, col, z) for row, col, z in points
+                if not self._is_region_point_excluded(region_id, (int(round(row)), int(round(col))))
+            ]
+            for region_id, points in self.region_focus_points.items()
+        }
+
     def _is_region_point_excluded(self, region_id: int, grid_cell: tuple[int, int]) -> bool:
         override = self.region_inclusion_override.get(region_id, {}).get(grid_cell)
         if override is not None:
