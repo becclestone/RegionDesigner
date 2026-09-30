@@ -90,6 +90,12 @@ _STATUS_LABEL_BG_COLORS = {
     "partial": QColor(110, 50, 170, 220),
 }
 
+# Redo-correction overlay (see SectionCanvas.redo_sections) - a distinct magenta so
+# it can't be confused with either the region-status fill above or the live scan
+# activity overlay below; drawn on top of both, since a marked section may also be
+# "scanned"/mid-rescan at the same time.
+_REDO_MARK_COLOR = QColor(255, 0, 255, 90)
+
 # Live per-section scan/reconstruction overlay (see SectionCanvas.section_activity
 # and set_section_activity) - drawn per painted section, on top of the coarser
 # region-level tint above, as ControllerBridge's sectionScanning/
@@ -116,6 +122,8 @@ class SectionCanvas(QGraphicsView):
     # region_id (int, or None for a global point), row, col - see mouseDoubleClickEvent
     focusPointAddRequested = Signal(object, float, float)
     focusPointRemoveRequested = Signal(object)  # FocusPointItem - see mousePressEvent
+    redoFocusPointSetRequested = Signal(float, float)  # see mousePressEvent (pick_redo_focus_mode)
+    redoFocusPointRemoveRequested = Signal()  # right-click on the redo focus point marker
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -149,6 +157,16 @@ class SectionCanvas(QGraphicsView):
         self.section_activity: dict[Section, str] = {}  # (row,col) -> "scanning" | "reconstructing" | "reconstructed"
         self.show_grid = False  # overlay of section-grid lines, toggled from the toolbar
         self.snap_focus_points_on_release = False  # see set_snap_focus_points_on_release
+
+        # Redo/correction (post-hoc): sections marked for a targeted rescan, and the
+        # brush/pick modes that populate them - see main_window's "Redo / Correct
+        # Scans" controls. Marking is restricted to already-painted sections (see
+        # _apply_stroke_to_sections) - a redo mark only makes sense on a section
+        # that's actually part of the loaded layout.
+        self.redo_sections: set[Section] = set()
+        self.redo_mode = False  # brush marks/unmarks redo_sections instead of painted
+        self.pick_redo_focus_mode = False  # a plain click places the single redo focus point
+        self.redo_focus_point_item: FocusPointItem | None = None
 
         self.brush_radius = 4  # radius in section-width units (true circular radius in scene pixels)
         self._painting = False
@@ -188,6 +206,10 @@ class SectionCanvas(QGraphicsView):
         self.section_activity = {}
         self.clear_focus_points()
         self.clear_global_focus_points()
+        self.redo_sections = set()
+        self.redo_mode = False
+        self.pick_redo_focus_mode = False
+        self.clear_redo_focus_point()
 
     def set_background_image(self, path: str):
         pixmap = _pil_to_qpixmap(_load_registered_image(path))
@@ -236,6 +258,9 @@ class SectionCanvas(QGraphicsView):
         # main_window._on_focus_point_shift_clicked.
         if event.button() == Qt.MouseButton.LeftButton and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
             clicked_item = self.itemAt(event.position().toPoint())
+            if clicked_item is self.redo_focus_point_item:
+                event.accept()  # nothing to review for a single redo point
+                return
             if isinstance(clicked_item, FocusPointItem):
                 self.focusPointShiftClicked.emit(clicked_item)
                 event.accept()
@@ -245,8 +270,17 @@ class SectionCanvas(QGraphicsView):
         # same unconditional priority as the shift+click case above, so it wins
         # over the brush's own right-click-to-erase behavior when the cursor is
         # actually over a marker. See main_window._on_focus_point_remove_requested.
+        # The redo focus point is checked first and routed to its own request
+        # signal (it isn't in focus_point_items/global_focus_point_items, so the
+        # generic remove-requested path below wouldn't actually find/remove it) -
+        # main_window decides whether it's safe to remove right now, same as it
+        # does for a normal focus point.
         if event.button() == Qt.MouseButton.RightButton:
             clicked_item = self.itemAt(event.position().toPoint())
+            if clicked_item is self.redo_focus_point_item:
+                self.redoFocusPointRemoveRequested.emit()
+                event.accept()
+                return
             if isinstance(clicked_item, FocusPointItem):
                 self.focusPointRemoveRequested.emit(clicked_item)
                 event.accept()
@@ -258,7 +292,19 @@ class SectionCanvas(QGraphicsView):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
 
-        if self.mask_image is None or not self.draw_mode:
+        # Pick-redo-focus mode: a plain left-click (not on an existing marker)
+        # places/moves the single redo focus point - checked before the brush
+        # gate below so it works regardless of draw_mode/redo_mode.
+        if self.pick_redo_focus_mode and event.button() == Qt.MouseButton.LeftButton and self.mask_image is not None:
+            clicked_item = self.itemAt(event.position().toPoint())
+            if not isinstance(clicked_item, FocusPointItem):
+                scene_pos = self.mapToScene(event.position().toPoint())
+                row, col = geom.point_to_section_center_f(scene_pos.x(), scene_pos.y(), self.anchor, self.zoom)
+                self.redoFocusPointSetRequested.emit(row, col)
+                event.accept()
+                return
+
+        if self.mask_image is None or not (self.draw_mode or self.redo_mode):
             super().mousePressEvent(event)
             return
 
@@ -344,7 +390,7 @@ class SectionCanvas(QGraphicsView):
             self._brush_cursor_item.setVisible(False)
 
     def _update_brush_cursor(self, view_pos):
-        if self.mask_image is None or not self.draw_mode:
+        if self.mask_image is None or not (self.draw_mode or self.redo_mode):
             self._hide_brush_cursor()
             return
         scene_pos = self.mapToScene(view_pos.toPoint())
@@ -427,7 +473,17 @@ class SectionCanvas(QGraphicsView):
                 if not outline.intersects(QRectF(x, y, w, h)):
                     continue
                 key = (row, col)
-                if self._erase_mode:
+                if self.redo_mode:
+                    if key not in self.painted:
+                        continue  # only an already-loaded section can be marked for redo
+                    if self._erase_mode:
+                        if key in self.redo_sections:
+                            self.redo_sections.discard(key)
+                            changed = True
+                    elif key not in self.redo_sections:
+                        self.redo_sections.add(key)
+                        changed = True
+                elif self._erase_mode:
                     if key in self.painted:
                         self.painted.discard(key)
                         self.region_of.pop(key, None)
@@ -485,6 +541,9 @@ class SectionCanvas(QGraphicsView):
             activity_color = _SECTION_ACTIVITY_COLORS.get(self.section_activity.get((row, col)))
             if activity_color is not None:
                 painter.fillRect(QRectF(x, y, w, h), activity_color)
+
+            if (row, col) in self.redo_sections:
+                painter.fillRect(QRectF(x, y, w, h), _REDO_MARK_COLOR)
 
         for region_id, (sum_x, sum_y, count) in region_centroid_sum.items():
             self._draw_region_label(
@@ -700,3 +759,34 @@ class SectionCanvas(QGraphicsView):
         """Continuous (row, col) per global focus point, same convention as
         focus_points_by_region()."""
         return [item.section() for item in self.global_focus_point_items]
+
+    # ---- redo/correction (post-hoc) ----
+    def set_redo_mode(self, enabled: bool):
+        self.redo_mode = enabled
+        if not enabled:
+            self._hide_brush_cursor()
+
+    def set_pick_redo_focus_mode(self, enabled: bool):
+        self.pick_redo_focus_mode = enabled
+
+    def clear_redo_marks(self):
+        self.redo_sections = set()
+        if self.mask_image is not None:
+            self._redraw_mask()
+
+    def set_redo_focus_point(self, row: float, col: float) -> FocusPointItem:
+        """Places (or moves, if one already exists) the single focus point used to
+        focus every section currently marked for redo - see main_window's "Set
+        Redo Focus Point" control. region_id=None, same neutral marker style as a
+        global focus point, since it isn't tied to any one compiled region."""
+        if self.redo_focus_point_item is not None:
+            self._scene.removeItem(self.redo_focus_point_item)
+        item = FocusPointItem(None, row, col, self)
+        self._scene.addItem(item)
+        self.redo_focus_point_item = item
+        return item
+
+    def clear_redo_focus_point(self):
+        if self.redo_focus_point_item is not None:
+            self._scene.removeItem(self.redo_focus_point_item)
+            self.redo_focus_point_item = None

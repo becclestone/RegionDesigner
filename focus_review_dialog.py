@@ -25,6 +25,7 @@ class FocusReviewDialog(QDialog):
     def __init__(
         self, bridge, calibration, region_id: int, fits: list[focus_fitting.FocusFit], parent=None,
         title: str | None = None,
+        region_ids: list[int | None] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title or f"Review Focus Points - Region {region_id}")
@@ -32,6 +33,13 @@ class FocusReviewDialog(QDialog):
         self.bridge = bridge
         self.calibration = calibration
         self.fits = fits
+        # Only set for a multi-region run (e.g. Global Focus Search), where
+        # self.fits mixes points from several regions and each point's own
+        # region needs to show in its list label - parallel to the point set
+        # the caller ran autofocus over, indexed the same way as self.fits
+        # (see main_window._run_global_focus_search). None for a single-region
+        # run, where region_id above already says which region every point is in.
+        self.region_ids = region_ids
         self.confirmed_z: dict[int, float] = {}
         self.confirmed_source: dict[int, str] = {}  # index -> "scan"/"manual"/"default", parallel to confirmed_z
         self._scan_worker = None
@@ -173,7 +181,11 @@ class FocusReviewDialog(QDialog):
     def _label_for(self, index: int) -> str:
         fit = self.fits[index]
         mark = "OK" if index in self.confirmed_z else "..."
-        return f"[{mark}] ({fit.row:.1f}, {fit.col:.1f})"
+        region_tag = ""
+        if self.region_ids is not None and index < len(self.region_ids):
+            rid = self.region_ids[index]
+            region_tag = ("global " if rid is None else f"R{rid} ")
+        return f"[{mark}] {region_tag}({fit.row:.1f}, {fit.col:.1f})"
 
     def _refresh_list_labels(self):
         for i in range(self.list_widget.count()):

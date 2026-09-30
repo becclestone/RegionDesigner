@@ -32,6 +32,10 @@ from Utilities.controller_commands import move_to_snap_position
 # so that call's own .get() can't mistake the stale reply for its own.
 _DEFAULT_AUTOFOCUS_TIMEOUT_S = 60.0
 _DEFAULT_SCAN_TIMEOUT_S = 120.0
+# Matches DOVER_UI/Utilities/path_utilites.py's _MAX_PATH_FRAGMENT_SIZE - a cPATH_MSG
+# longer than this must be pre-loaded in chunks (cPATH_LOAD_FRAGMENT) before the final
+# chunk actually starts the scan; see _send_path_msg.
+_MAX_PATH_FRAGMENT_SIZE = 25
 
 # MEMS (scanning-mirror) sine-drive defaults - DOVER_UI/Windows/main_window.py:349-362,
 # same values as DOVER_UI/Windows/main_window_layouts.py's cX_AMPLITUDE_RESET etc. The
@@ -354,52 +358,126 @@ class ControllerBridge(QObject):
 
             # Discard any reconstruction-off leftover from a previous call before
             # sending this one, same reasoning as _drain(self._path_reply_queue)
-            # below - otherwise a stale broadcast from a prior scan could satisfy
-            # a wait_for_reconstruction_off() call that belongs to this one.
+            # inside _send_path_msg - otherwise a stale broadcast from a prior scan
+            # could satisfy a wait_for_reconstruction_off() call that belongs to
+            # this one.
             _drain(self._reconstruction_reply_queue)
 
-            path_json = json.dumps([[row, col, z, False, 0] for row, col, z in sections])
-            payload = {
-                ic.cTAB_SENDER: "region_designer",
-                ic.cPATH_SCAN_TYPE: True,
-                ic.cSELECTED_MOTION_PROFILE: 2,
-                ic.cSCAN_ACCELERATION: 200,
-                ic.cSCAN_JERK: 0,
-                ic.cFOCUS_ACCELERATION: 150,
-                ic.cFOCUS_JERK: 0,
-                ic.cJOG_ACCELERATION: 400,
-                ic.cJOG_JERK: 0,
-                ic.cIGNORE_TIMING: True,
-                ic.cRUN_SCAN_TRACE: False,
-                ic.cSECTION_ROW: 0,
-                ic.cSECTION_COL: 0,
-                ic.cPATH: path_json,
-                ic.cIS_LUCAS_PATH: True,
-                # dover_ctl2/src/MsgHandler.cpp:932-933 (handle_path) reads these two
-                # unconditionally for every cPATH_MSG, regardless of scan_type - a
-                # missing field auto-vivifies as JSON null on the controller side,
-                # which throws "type must be boolean, but is null" there. This is
-                # never actually a resumed scan here, so False/"" (DOVER_UI's own
-                # defaults - see Utilities/path_utilites.py's send_execute_path_msg).
-                ic.cIS_RESUMED_SCAN_PATH: False,
-                ic.cIS_RESUME_DIRECTORY_NAME: "",
-            }
-            msg = TIsMsg.create_cmd_msg(ic.cPATH_MSG, ic.CTL_TARGET)
-            msg.add_msg_payload(payload)
-            _drain(self._path_reply_queue)
-            msg.send_q_destroy()
-
-            kind, reply_payload = self._path_reply_queue.get(timeout=timeout)
-            if kind == "ack":
-                if reply_payload.get(src.cERROR) != src.cSUCCESS:
-                    raise RuntimeError(reply_payload.get(src.cERROR_STR, "Path rejected by controller."))
-                # Accepted - now wait for the actual completion notice.
-                kind, reply_payload = self._path_reply_queue.get(timeout=timeout)
-
-            if reply_payload.get(src.cERROR) != src.cSUCCESS:
-                raise RuntimeError(reply_payload.get(src.cERROR_STR, "Scan failed."))
+            path_rows = [[row, col, z, False, 0] for row, col, z in sections]
+            self._send_path_msg(path_rows, is_lucas_path=True, timeout=timeout)
         finally:
             self._busy = False
+
+    def run_plane_path_scan(self, rows: list[tuple[int, int, int, int]],
+                             timeout: float | None = None) -> None:
+        """Blocking - call from a worker thread, never the GUI thread. Sends `rows`
+        (already the final San_Path_Planning [row, col, donor_idx, region] shape -
+        see scan_path_export.py - row/col already the FINAL master-grid values, same
+        convention as run_path_scan above) as a real CLOSED-LOOP Plane Path scan
+        (cIS_LUCAS_PATH: False) - the same mechanism DOVER_UI's own Scan button and
+        "Load Plane Path" use (Utilities/path_utilites.py's send_path), NOT this
+        class's own run_path_scan above (open-loop Lucas path, literal z per
+        section). donor_idx marks which rows the controller live-autofocuses during
+        the scan itself (a row whose donor_idx equals its own position in the list)
+        versus which borrow that measurement from a neighboring donor - the
+        controller performs this propagation itself; there is no z in these rows
+        for this method to use client-side at all.
+
+        cPATH_UPDATE_MSG still fires exactly once, at the very end of the whole
+        path (same as run_path_scan - see its docstring) - use this bridge's
+        sectionScanning/sectionReconstructing signals for live per-section
+        progress instead, which already fire the same way for this path as they
+        do for a Lucas one."""
+        if self._busy:
+            raise RuntimeError("Another hardware operation is already in progress.")
+        if not rows:
+            raise ValueError("run_plane_path_scan needs at least one row.")
+        if timeout is None:
+            timeout = _DEFAULT_SCAN_TIMEOUT_S * len(rows)
+        self._busy = True
+        try:
+            row_vals = [r[0] for r in rows]
+            col_vals = [r[1] for r in rows]
+            self.send_scan_section_binding_rect((min(row_vals), min(col_vals)), (max(row_vals), max(col_vals)))
+
+            sm.safemon_action_scan()
+            sleep(0.3)
+
+            _drain(self._reconstruction_reply_queue)
+
+            path_rows = [[int(row), int(col), int(donor_idx), False, int(region)]
+                         for row, col, donor_idx, region in rows]
+            self._send_path_msg(path_rows, is_lucas_path=False, timeout=timeout)
+        finally:
+            self._busy = False
+
+    def _send_path_msg(self, path_rows: list[list], is_lucas_path: bool, timeout: float) -> None:
+        """Fragments (if needed) and sends path_rows via cPATH_MSG, mirroring
+        DOVER_UI's Utilities/path_utilites.py send_path's >_MAX_PATH_FRAGMENT_SIZE-
+        row chunking: one cPATH_LOAD_FRAGMENT command per 25-row chunk (the
+        controller just appends each into an accumulation buffer - dover_ctl2/src/
+        MsgHandler.cpp's handle_path), then the final (possibly only) chunk via the
+        normal cPATH_MSG scan-execute payload, which both starts the scan and
+        terminates the accumulation. Blocks for the ack + completion replies.
+        Shared by run_path_scan (Lucas) and run_plane_path_scan (Plane) above -
+        they differ only in row shape and is_lucas_path; both already handle the
+        binding-rect/safemon/reconstruction-queue steps that must happen first."""
+        _drain(self._path_reply_queue)
+
+        if len(path_rows) > _MAX_PATH_FRAGMENT_SIZE:
+            frag_msg = TIsMsg.create_cmd_msg(ic.cPATH_LOAD_FRAGMENT, ic.CTL_TARGET)
+            num_fragments = len(path_rows) // _MAX_PATH_FRAGMENT_SIZE
+            for i in range(num_fragments):
+                chunk = path_rows[i * _MAX_PATH_FRAGMENT_SIZE:(i + 1) * _MAX_PATH_FRAGMENT_SIZE]
+                frag_msg.add_msg_payload({
+                    ic.cTAB_SENDER: "region_designer",
+                    ic.cPATH: json.dumps(chunk),
+                    ic.cIS_LUCAS_PATH: is_lucas_path,
+                })
+                frag_msg.send_q()
+                sleep(0.02)  # avoid flooding, same as DOVER_UI's send_path
+            remainder = path_rows[num_fragments * _MAX_PATH_FRAGMENT_SIZE:]
+        else:
+            remainder = path_rows
+
+        payload = {
+            ic.cTAB_SENDER: "region_designer",
+            ic.cPATH_SCAN_TYPE: True,
+            ic.cSELECTED_MOTION_PROFILE: 2,
+            ic.cSCAN_ACCELERATION: 200,
+            ic.cSCAN_JERK: 0,
+            ic.cFOCUS_ACCELERATION: 150,
+            ic.cFOCUS_JERK: 0,
+            ic.cJOG_ACCELERATION: 400,
+            ic.cJOG_JERK: 0,
+            ic.cIGNORE_TIMING: True,
+            ic.cRUN_SCAN_TRACE: False,
+            ic.cSECTION_ROW: 0,
+            ic.cSECTION_COL: 0,
+            ic.cPATH: json.dumps(remainder),
+            ic.cIS_LUCAS_PATH: is_lucas_path,
+            # dover_ctl2/src/MsgHandler.cpp:932-933 (handle_path) reads these two
+            # unconditionally for every cPATH_MSG, regardless of scan_type - a
+            # missing field auto-vivifies as JSON null on the controller side,
+            # which throws "type must be boolean, but is null" there. This is
+            # never actually a resumed scan here, so False/"" (DOVER_UI's own
+            # defaults - see Utilities/path_utilites.py's send_execute_path_msg).
+            ic.cIS_RESUMED_SCAN_PATH: False,
+            ic.cIS_RESUME_DIRECTORY_NAME: "",
+        }
+        msg = TIsMsg.create_cmd_msg(ic.cPATH_MSG, ic.CTL_TARGET)
+        msg.add_msg_payload(payload)
+        msg.send_q_destroy()
+
+        kind, reply_payload = self._path_reply_queue.get(timeout=timeout)
+        if kind == "ack":
+            if reply_payload.get(src.cERROR) != src.cSUCCESS:
+                raise RuntimeError(reply_payload.get(src.cERROR_STR, "Path rejected by controller."))
+            # Accepted - now wait for the actual completion notice.
+            kind, reply_payload = self._path_reply_queue.get(timeout=timeout)
+
+        if reply_payload.get(src.cERROR) != src.cSUCCESS:
+            raise RuntimeError(reply_payload.get(src.cERROR_STR, "Scan failed."))
 
     def shutdown(self):
         self._running = False
