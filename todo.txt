@@ -1,0 +1,14 @@
+snap on drag onbydefault
+move to scan position ag\ftersnap
+snap onplace
+orange
+consistent z range probably by region idk
+somehow make selections more clear pls cause
+
+focus plot:
+- make jumping to a different region more obvious in the list - separate them and display region number near focus plot
+- show (ok/excl) near the focus plot
+- use x to indicate excluded points on overview pic
+- click on point to show focus plot
+
+make scan button bigger and different colour
