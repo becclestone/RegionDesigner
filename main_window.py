@@ -89,6 +89,7 @@ class RegionDesignerWindow(QMainWindow):
         self._goji_scheduler = GojiScheduler(self.bridge)
         self._dover_window = DoverControllerWindow(self.bridge, self._goji_scheduler, parent=self)
         self._dover_window.calibrationLoaded.connect(self._on_dover_calibration_loaded)
+        self._dover_window.show()
 
         self.calibration: StageCalibration | None = None
         self.region_focus_points: dict[int, list[tuple[float, float, float]]] = {}  # region_id -> [(row,col,z)]
