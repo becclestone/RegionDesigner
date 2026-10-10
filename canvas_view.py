@@ -119,7 +119,9 @@ _SECTION_ACTIVITY_COLORS = {
 class SectionCanvas(QGraphicsView):
     sectionsChanged = Signal()
     focusPointShiftClicked = Signal(object)  # FocusPointItem - see mousePressEvent
-    # region_id (int, or None for a global point), row, col - see mouseDoubleClickEvent
+    # region_id (int, or None if that section isn't assigned to a compiled
+    # region yet - main_window then asks to compile regions first), row, col -
+    # see mouseDoubleClickEvent
     focusPointAddRequested = Signal(object, float, float)
     focusPointRemoveRequested = Signal(object)  # FocusPointItem - see mousePressEvent
     redoFocusPointSetRequested = Signal(float, float)  # see mousePressEvent (pick_redo_focus_mode)
@@ -176,11 +178,6 @@ class SectionCanvas(QGraphicsView):
         self._brush_cursor_item: QGraphicsEllipseItem | None = None
 
         self.focus_point_items: list[FocusPointItem] = []
-        # Separate from focus_point_items (region_id=None, not tied to a
-        # compiled region) so Compile Regions/Clear Regions - which reset the
-        # per-region list - don't also throw away a Global Focus Search run.
-        # See main_window's Global Focus Search controls.
-        self.global_focus_point_items: list[FocusPointItem] = []
 
     # ---- background image ----
     def reset(self):
@@ -205,7 +202,6 @@ class SectionCanvas(QGraphicsView):
         self.region_progress = {}
         self.section_activity = {}
         self.clear_focus_points()
-        self.clear_global_focus_points()
         self.redo_sections = set()
         self.redo_mode = False
         self.pick_redo_focus_mode = False
@@ -271,8 +267,8 @@ class SectionCanvas(QGraphicsView):
         # over the brush's own right-click-to-erase behavior when the cursor is
         # actually over a marker. See main_window._on_focus_point_remove_requested.
         # The redo focus point is checked first and routed to its own request
-        # signal (it isn't in focus_point_items/global_focus_point_items, so the
-        # generic remove-requested path below wouldn't actually find/remove it) -
+        # signal (it isn't in focus_point_items, so the generic remove-requested
+        # path below wouldn't actually find/remove it) -
         # main_window decides whether it's safe to remove right now, same as it
         # does for a normal focus point.
         if event.button() == Qt.MouseButton.RightButton:
@@ -322,9 +318,9 @@ class SectionCanvas(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        """Double-click empty canvas to add a focus point there - into whichever
-        region owns the section under the cursor, or as a global point (see
-        main_window's Global Focus Search controls) if that section isn't
+        """Double-click empty canvas to add a focus point there, into whichever
+        region owns the section under the cursor - main_window rejects the
+        request (asking to compile regions first) if that section isn't
         painted/assigned to one yet. Double-clicking an existing marker does
         nothing special here (falls through to Qt's normal handling).
 
@@ -688,7 +684,8 @@ class SectionCanvas(QGraphicsView):
         self.region_progress = {}
         self.section_activity = {}
         self._hide_brush_cursor()
-        self._redraw_mask()
+        if self.mask_image is not None:
+            self._redraw_mask()
 
     def clear_regions(self):
         """Undo compilation: drop region assignments/focus points and go back to
@@ -714,26 +711,21 @@ class SectionCanvas(QGraphicsView):
         return item
 
     def remove_focus_point(self, item: FocusPointItem):
-        """Removes one focus point marker - region or global, whichever list it's
-        actually in - see main_window._on_focus_point_remove_requested (right-click)."""
-        if item in self.focus_point_items:
-            self.focus_point_items.remove(item)
-        elif item in self.global_focus_point_items:
-            self.global_focus_point_items.remove(item)
-        else:
+        """Removes one focus point marker - see
+        main_window._on_focus_point_remove_requested (right-click)."""
+        if item not in self.focus_point_items:
             return
+        self.focus_point_items.remove(item)
         self._scene.removeItem(item)
 
     def snap_focus_points_to_grid(self) -> int:
-        """Resets every focus point (region and global) back to the exact center
-        of its nearest section, undoing any free-form drag - e.g. after points
-        were dragged against a grid anchor that later turned out to be wrong.
-        Returns the number of points snapped."""
+        """Resets every focus point back to the exact center of its nearest
+        section, undoing any free-form drag - e.g. after points were dragged
+        against a grid anchor that later turned out to be wrong. Returns the
+        number of points snapped."""
         for item in self.focus_point_items:
             item.snap_to_grid()
-        for item in self.global_focus_point_items:
-            item.snap_to_grid()
-        return len(self.focus_point_items) + len(self.global_focus_point_items)
+        return len(self.focus_point_items)
 
     def focus_points_by_region(self) -> dict[int, list[tuple[float, float]]]:
         """Continuous (row, col) per point (see FocusPointItem.section) - not the
@@ -742,23 +734,6 @@ class SectionCanvas(QGraphicsView):
         for item in self.focus_point_items:
             out.setdefault(item.region_id, []).append(item.section())
         return out
-
-    # ---- global focus points (Global Focus Search - not tied to a region) ----
-    def clear_global_focus_points(self):
-        for item in self.global_focus_point_items:
-            self._scene.removeItem(item)
-        self.global_focus_point_items.clear()
-
-    def add_global_focus_point(self, row: int, col: int) -> FocusPointItem:
-        item = FocusPointItem(None, row, col, self)
-        self._scene.addItem(item)
-        self.global_focus_point_items.append(item)
-        return item
-
-    def global_focus_points(self) -> list[tuple[float, float]]:
-        """Continuous (row, col) per global focus point, same convention as
-        focus_points_by_region()."""
-        return [item.section() for item in self.global_focus_point_items]
 
     def assign_new_region(self, sections: set[Section]) -> int:
         """Carves a brand-new region out of an arbitrary sub-selection of already-
@@ -793,8 +768,8 @@ class SectionCanvas(QGraphicsView):
     def set_redo_focus_point(self, row: float, col: float) -> FocusPointItem:
         """Places (or moves, if one already exists) the single focus point used to
         focus every section currently marked for redo - see main_window's "Set
-        Redo Focus Point" control. region_id=None, same neutral marker style as a
-        global focus point, since it isn't tied to any one compiled region."""
+        Redo Focus Point" control. region_id=None, drawn with a neutral marker
+        style since it isn't tied to any one compiled region."""
         if self.redo_focus_point_item is not None:
             self._scene.removeItem(self.redo_focus_point_item)
         item = FocusPointItem(None, row, col, self)

@@ -1,16 +1,17 @@
 """Multi-point plane-fit review, styled like focus_review_dialog.FocusReviewDialog's
-own clickable point list: browse every point in a set (a region's, or the
-global one) one at a time, see its focus curve plus how far the current plane
-predicts its Z from what was actually chosen, and toggle whether it's used in
-plane fitting. Selecting a point highlights its marker in red on the canvas
-(see focus_point_item.FocusPointItem.set_highlighted) so it can be found on
-the sample.
+own clickable point list: browse every point in a set (one region's own
+points, or the combined Global Focus Search group spanning every region) one
+at a time, see its focus curve plus how far the current plane predicts its Z
+from what was actually chosen, and toggle whether it's used in plane fitting.
+Selecting a point highlights its marker in red on the canvas (see
+focus_point_item.FocusPointItem.set_highlighted) so it can be found on the
+sample.
 
 Kept free of any exclusion/plane-fitting logic of its own - all of that lives
 in main_window and is supplied here via plain callables, since what "excluded"
-or "the current plane" even means differs for a region point vs. a global one.
-Non-modal (like FocusReviewDialog), so the canvas stays visible/interactive
-alongside it while browsing."""
+or "the current plane" even means differs for a region's own review vs. the
+global one. Non-modal (like FocusReviewDialog), so the canvas stays visible/
+interactive alongside it while browsing."""
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem, QLabel, QPushButton

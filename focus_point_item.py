@@ -31,10 +31,11 @@ _EXCLUDED_FILL_COLOR = QColor(90, 90, 90, 255)
 # spotted on the sample regardless of its focusing/exclusion status.
 _HIGHLIGHT_COLOR = QColor(255, 0, 0, 255)
 
-# Global focus points (region_id=None - not tied to any one compiled region,
-# see main_window's Global Focus Search controls) get a fixed neutral border
-# instead of a per-region palette color, since they aren't associated with one.
-_GLOBAL_BORDER_COLOR = QColor(255, 255, 255)
+# The single redo focus point (region_id=None - see
+# canvas_view.SectionCanvas.set_redo_focus_point) isn't tied to any one
+# compiled region, so it gets a fixed neutral border instead of a per-region
+# palette color.
+_NO_REGION_BORDER_COLOR = QColor(255, 255, 255)
 
 
 class FocusPointItem(QGraphicsEllipseItem):
@@ -55,7 +56,7 @@ class FocusPointItem(QGraphicsEllipseItem):
         self.fit = None
         self.z: float | None = None
 
-        border_color = QColor(_GLOBAL_BORDER_COLOR if region_id is None else region_color(region_id))
+        border_color = QColor(_NO_REGION_BORDER_COLOR if region_id is None else region_color(region_id))
         border_color.setAlpha(_BORDER_ALPHA)
 
         self.setBrush(QBrush(_FILL_COLOR))

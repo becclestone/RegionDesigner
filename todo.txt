@@ -1,5 +1,6 @@
-snap on drag onbydefault
 DONE - move to scan position after snap / scan path
+
+snap on drag onbydefault
 snap onplace
 consistent z range probably by region idk
 somehow make selections more clear pls cause
@@ -13,3 +14,5 @@ focus plot:
 make scan button bigger and different colour
 
 show section number (r,c)
+
+Add button to open each window from the other.
