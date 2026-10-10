@@ -231,6 +231,19 @@ class ControllerBridge(QObject):
     # via controller_window.py's set_motion_locked) - see the refactor plan's
     # "accepted risks" section for the reply-correlation caveat this inherits.
 
+    def safemon_autofocus_start(self) -> None:
+        """Mirrors the safemon interlock the Autofocus tab's "Calculate focus" button
+        sends before the request (main_window.py:1133) - kept as a thin bridge wrapper
+        (not called from inside run_autofocus/run_autofocus_full) so the existing
+        autofocus_client.py pipeline's behavior is unchanged; only the interactive tab
+        opts into it, same as DOVER_UI's own tab-button-scoped timing."""
+        sm.safemon_action_autofocus()
+
+    def safemon_idle(self) -> None:
+        """Mirrors handle_calculated_focus_values' sm.safemon_action_idle() (main_window.py:1032) -
+        see safemon_autofocus_start."""
+        sm.safemon_action_idle()
+
     def send_param(self, msg_type: str, target: str, payload: dict) -> None:
         """Generic fire-and-forget single-message param push, for the many DOVER_UI
         System Config / MEMS-slider / Laser-power commands that are just one
@@ -247,29 +260,12 @@ class ControllerBridge(QObject):
         msg.send_q_destroy()
 
     # --- Manual Moves tab ---
-
-    def start_compound_move(self, x_speed: float, y_speed: float, z_speed: float) -> None:
-        """Mirrors MainWindow.start_compound_moves (main_window.py:497-514): moves X/Y/Z
-        together at the given per-axis speeds, no target position (jog-style, stops when
-        the stage hits its limit or another move/reset is sent)."""
-        payload = {
-            ic.cTAB_SENDER: "region_designer",
-            ic.cX_SPEED_VAL: x_speed, ic.cY_SPEED_VAL: y_speed, ic.cZ_SPEED_VAL: z_speed,
-            ic.cX_ALT_SPEED_VAL: x_speed, ic.cY_ALT_SPEED_VAL: y_speed, ic.cZ_ALT_SPEED_VAL: z_speed,
-        }
-        self.send_param(ic.cSTART_COMPOUND_MOVE_MSG, ic.CTL_TARGET, payload)
-
-    def start_single_axis_move(self, axis: str, speed: float) -> None:
-        """Mirrors MainWindow.start_x_moves/start_y_moves/start_z_moves (main_window.py:
-        516-556, three nearly-identical functions collapsed into one here) - jog-style
-        single-axis move at the given speed, same no-target-position semantics as
-        start_compound_move. axis is 'x', 'y', or 'z'."""
-        msg_type, speed_key = {
-            "x": (ic.cSTART_X_MOVE_MSG, ic.cX_SPEED_VAL),
-            "y": (ic.cSTART_Y_MOVE_MSG, ic.cY_SPEED_VAL),
-            "z": (ic.cSTART_Z_MOVE_MSG, ic.cZ_SPEED_VAL),
-        }[axis]
-        self.send_param(msg_type, ic.CTL_TARGET, {ic.cTAB_SENDER: "region_designer", speed_key: speed})
+    # Note: DOVER_UI's jog-style "Pre-programmed Moves" tab (pc.MOVES_TAB -
+    # start_compound_moves/start_x/y/z_moves, cSTART_COMPOUND_MOVE_MSG/
+    # cSTART_X/Y/Z_MOVE_MSG) is commented out of its own make_main_layout()
+    # (main_window_layouts.py:1253) - dead code, not reachable in the live app - so
+    # it's intentionally not ported here. The real "Manual Moves" tab is absolute/
+    # programmed moves only (move_axis_absolute/move_xyz_absolute below).
 
     def move_axis_absolute(self, axis: str, pos: float, speed: float) -> None:
         """Mirrors MainWindow.move_stage_x_pm/move_stage_y_pm/move_stage_z_pm
@@ -437,6 +433,22 @@ class ControllerBridge(QObject):
         payload = {ic.cDETECTION_LASER_SCAN_POWER_LEVEL: scan_power, ic.cDETECTION_LASER_FOCUS_POWER_LEVEL: focus_power}
         self.send_param(ic.cSET_OXXIUS_POWER_MSG, ic.CTL_TARGET, payload)
 
+    # --- System Config tab ---
+
+    def send_quit(self, target: str) -> None:
+        """Mirrors MainWindow.stop_module (main_window.py:106-108) - the System Config
+        tab's "Stop Now" buttons (and, for whichever modules the "On UI Quit"
+        checkboxes have checked, RegionDesignerWindow's own closeEvent) immediately
+        quitting one backend module."""
+        msg = TIsMsg.create_cmd_msg(src.cQUIT, target)
+        msg.send_q_destroy()
+
+    def safemon_motion(self) -> None:
+        """Mirrors sm.safemon_action_motion(), sent before Move to Scan/Snap Position
+        (main_window.py:1429-1434) - kept as a thin wrapper for the same reason as
+        safemon_autofocus_start/safemon_idle above."""
+        sm.safemon_action_motion()
+
     def wait_for_reconstruction_off(self, row: int, col: int, timeout: float) -> bool:
         """Blocks up to timeout for the controller's reconstruction-off
         broadcast for this specific (row, col) section. Returns True if it
@@ -473,6 +485,19 @@ class ControllerBridge(QObject):
         row/col). For sub-cell precision despite only-whole-row/col addressing,
         autofocus_client.py temporarily shifts the controller's anchor via
         set_anchor() below before calling this."""
+        return self._run_autofocus_request(row, col, z_start, z_step, num_layers, timeout)[ic.cPLOT_FOCUS_VALUES_PARAM]
+
+    def run_autofocus_full(self, row: int, col: int, z_start: float, z_step: float, num_layers: int,
+                            timeout: float = _DEFAULT_AUTOFOCUS_TIMEOUT_S) -> dict:
+        """Same request as run_autofocus, but returns the full reply payload instead of
+        just the curve - the Autofocus tab (dover_controller/autofocus_tab.py) also
+        needs cCALCULATED_FOCUS_PARAM (the controller's suggested curve index), which
+        run_autofocus's existing callers (autofocus_client.py) have never needed and
+        whose return contract (list) stays unchanged for them."""
+        return self._run_autofocus_request(row, col, z_start, z_step, num_layers, timeout)
+
+    def _run_autofocus_request(self, row: int, col: int, z_start: float, z_step: float, num_layers: int,
+                                timeout: float) -> dict:
         if self._busy:
             raise RuntimeError("Another hardware operation is already in progress.")
         self._busy = True
@@ -490,8 +515,7 @@ class ControllerBridge(QObject):
             _drain(self._autofocus_reply_queue)
             msg.send_q_destroy()
 
-            reply_payload = self._autofocus_reply_queue.get(timeout=timeout)
-            return reply_payload[ic.cPLOT_FOCUS_VALUES_PARAM]
+            return self._autofocus_reply_queue.get(timeout=timeout)
         finally:
             self._busy = False
 

@@ -9,6 +9,8 @@ from PySide6.QtWidgets import (
 
 from canvas_view import SectionCanvas
 from controller_bridge import ControllerBridge
+from dover_controller.controller_window import DoverControllerWindow
+from goji_scheduler import GojiScheduler
 import confirmation_scan
 import autofocus_log
 import region_clustering as clustering
@@ -83,6 +85,10 @@ class RegionDesignerWindow(QMainWindow):
         self.bridge.commandError.connect(self._on_command_error)
         self.bridge.sectionScanning.connect(self._on_section_scanning)
         self.bridge.sectionReconstructing.connect(self._on_section_reconstructing)
+
+        self._goji_scheduler = GojiScheduler(self.bridge)
+        self._dover_window = DoverControllerWindow(self.bridge, self._goji_scheduler, parent=self)
+        self._dover_window.calibrationLoaded.connect(self._on_dover_calibration_loaded)
 
         self.calibration: StageCalibration | None = None
         self.region_focus_points: dict[int, list[tuple[float, float, float]]] = {}  # region_id -> [(row,col,z)]
@@ -205,6 +211,7 @@ class RegionDesignerWindow(QMainWindow):
         self._load_default_calibration()
 
         self.bridge.connect_to_controller()
+        self._goji_scheduler.start()
 
     def _load_default_calibration(self):
         path = _find_default_calibration_path()
@@ -285,6 +292,15 @@ class RegionDesignerWindow(QMainWindow):
         load_cal_btn = QPushButton("Load Calibration...")
         load_cal_btn.clicked.connect(self._on_load_calibration_clicked)
         toolbar.addWidget(load_cal_btn)
+
+        dover_controller_btn = QPushButton("Dover Controller...")
+        dover_controller_btn.setToolTip(
+            "Opens the Dover Controller window - manual jog, section moves, calibration, "
+            "focus jog, autofocus, MEMS, lasers, and system config, the same raw hardware "
+            "controls DOVER_UI's own Dover Controller window provides."
+        )
+        dover_controller_btn.clicked.connect(self._on_dover_controller_clicked)
+        toolbar.addWidget(dover_controller_btn)
 
         toolbar.addSeparator()
 
@@ -1116,11 +1132,26 @@ class RegionDesignerWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Select a calibration data file", "", "JSON Files (*.json)")
         if not path:
             return
+        self._load_calibration_from_path(path)
+
+    def _load_calibration_from_path(self, path: str) -> None:
         try:
             self.calibration = StageCalibration.load(path)
             self.status_label.setText(f"Calibration loaded: {path}")
         except Exception as e:
             QMessageBox.warning(self, "Load Calibration", f"Could not load calibration: {e}")
+
+    def _on_dover_controller_clicked(self) -> None:
+        self._dover_window.show()
+        self._dover_window.raise_()
+        self._dover_window.activateWindow()
+
+    def _on_dover_calibration_loaded(self, path: str) -> None:
+        # The Dover Controller window's Calibration tab (Save or Load) just wrote/read
+        # this same calibration file - reload it here too so this window's own
+        # section_to_absolute_xy math never silently disagrees with that window's
+        # manual-jog readouts. See dover_controller/controller_window.py's docstring.
+        self._load_calibration_from_path(path)
 
     def _on_run_autofocus_clicked(self):
         self._start_autofocus_run(auto_confirm=False, auto_finish=False)
@@ -2554,5 +2585,7 @@ class RegionDesignerWindow(QMainWindow):
     def closeEvent(self, event):
         if self._scan_worker is not None:
             self.bridge.cancel_current_scan()
+        self._dover_window.send_quit_on_exit()
+        self._goji_scheduler.stop()
         self.bridge.shutdown()
         super().closeEvent(event)
