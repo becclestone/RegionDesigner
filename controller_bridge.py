@@ -21,7 +21,7 @@ import IsMsgPy.shared_rmq_constants as src
 from IsMsgPy.IsMsg import TIsMsg
 from IsMsgPy.rmq_setup import LoginCredentials, rmq_setup, rmg_log_hb_setup
 from Utilities import safemon_msg_senders as sm
-from Utilities.controller_commands import move_to_snap_position
+from Utilities.controller_commands import move_to_scan_position, move_to_snap_position
 
 # cCALCULATE_AUTOFOCUS_MSG and cPATH_MSG replies (cCALCULATED_FOCUS_VALUES_MSG,
 # cPATH_UPDATE_MSG) carry no per-request correlation id - they're fresh broadcast
@@ -136,6 +136,7 @@ class ControllerBridge(QObject):
             # light on, so it must be turned back off once the image is in -
             # otherwise it's left on indefinitely since nothing else does this.
             sm.safemon_action_camera_light_off()
+            self._return_to_scan_position()
             self.imageReady.emit(payload[ic.cIMAGE_PATH])
         elif msg_type == ic.cCALCULATED_FOCUS_VALUES_MSG:
             self._autofocus_reply_queue.put(msg.get_msg_payload())
@@ -219,6 +220,15 @@ class ControllerBridge(QObject):
         sm.safemon_action_snap()
         sleep(0.3)
         move_to_snap_position()
+
+    def _return_to_scan_position(self) -> None:
+        """Hardware constraint: the stages should sit at the scan position as much
+        as possible, so this is called once a snap (on cIMAGE_READY_MSG, above) or
+        a scan path (end of run_path_scan/run_plane_path_scan, below) finishes.
+        Mirrors dover_controller/system_config_tab.py's "Move to Scan Position"
+        button sequence (safemon_action_motion() interlock, then the move itself)."""
+        sm.safemon_action_motion()
+        move_to_scan_position()
 
     def is_busy(self) -> bool:
         return self._busy
@@ -642,6 +652,7 @@ class ControllerBridge(QObject):
 
             path_rows = [[row, col, z, False, 0] for row, col, z in sections]
             self._send_path_msg(path_rows, is_lucas_path=True, timeout=timeout)
+            self._return_to_scan_position()
         finally:
             self._busy = False
 
@@ -685,6 +696,7 @@ class ControllerBridge(QObject):
             path_rows = [[int(row), int(col), int(donor_idx), False, int(region)]
                          for row, col, donor_idx, region in rows]
             self._send_path_msg(path_rows, is_lucas_path=False, timeout=timeout)
+            self._return_to_scan_position()
         finally:
             self._busy = False
 
