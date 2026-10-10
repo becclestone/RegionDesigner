@@ -47,6 +47,17 @@ class StageCalibration:
             offset_col=cal[pc.cCOL],
         )
 
+    def save(self, calibration_json_path: str) -> None:
+        """Mirrors DOVER_UI's prepare_calibration_data/save_calibration_data_as
+        (main_window.py:192-1208) - same key shape load() reads back, so a file saved
+        from the Dover Controller window's Calibration tab loads identically here."""
+        cal = {
+            pc.cX: self.anchor_x, pc.cY: self.anchor_y, pc.cZ: self.anchor_z,
+            pc.cZO: self.z_offset_correction, pc.cROW: self.offset_row, pc.cCOL: self.offset_col,
+        }
+        with open(calibration_json_path, "w") as f:
+            json.dump(cal, f)
+
     def section_to_absolute_xy(self, row: float, col: float) -> tuple[float, float]:
         """Mirrors positioning_utilities.cpp's SectionXPosition/SectionYPosition exactly,
         including the Y axis being inverted relative to col. row/col may be

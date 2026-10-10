@@ -74,6 +74,15 @@ class ControllerBridge(QObject):
     # section, independent of whether the path itself is open- or closed-loop.
     sectionScanning = Signal(int, int, bool)        # master_row, master_col, is_scanning
     sectionReconstructing = Signal(int, int, bool)  # master_row, master_col, is_reconstructing
+    # Generic dispatch for the Dover Controller window's many tabs (dover_controller/) -
+    # avoids ~30 new named signals turning this class into a god-object; mirrors DOVER_UI's
+    # own single-dispatcher shape (handle_window_events), just split per-tab instead of one
+    # 450-line method. Each tab connects and filters by the (str) key itself.
+    replyReceived = Signal(str, dict)       # reply_type, payload - any src.cREPLY_MSG not
+                                             # already handled above (see _handle_message)
+    broadcastReceived = Signal(str, dict)   # msg_type, payload - any other COMM broadcast
+                                             # not already handled above
+    temperatureUpdated = Signal(dict)       # payload keyed by ic.cTEMP_SENSOR_1..7
 
     def __init__(self):
         super().__init__()
@@ -148,29 +157,59 @@ class ControllerBridge(QObject):
             self._path_reply_queue.put(("ack", msg.get_msg_payload()))
         elif msg_type == src.cREPLY_MSG and msg.get_msg_reply_type() == ic.cSET_ANCHOR_POINT_MSG:
             self._anchor_reply_queue.put(msg.get_msg_payload())
+        elif msg_type == ic.cTEMP_UPDATE_MSG:
+            # Dedicated signal (not folded into broadcastReceived below) - every Dover
+            # Controller tab/status strip cares about it and it's high-frequency.
+            self.temperatureUpdated.emit(msg.get_msg_payload())
+        elif msg_type == ic.cINTERNAL_CONFIG_VALUES_MSG:
+            # Mirrors MessageHandler.handle_internal_config_msg: the reply's own
+            # fSenderSignature (which module answered - CTL_TARGET/RECONSTRUCTION_TARGET/
+            # STITCHER_TARGET/SAFE_MON_TARGET) says which fields the payload carries and
+            # which tab's widgets to resync, so it's folded into the payload dict here
+            # rather than dropped - see request_internal_config's docstring.
+            payload = dict(msg.get_msg_payload())
+            payload["_sender"] = msg.get_sender_signature()
+            self.broadcastReceived.emit(msg_type, payload)
+        elif msg_type == src.cREPLY_MSG:
+            # Catch-all for every other request/reply pair the Dover Controller window's
+            # tabs need (discover stages/MEMS, position update, reset stage, section/axis/
+            # compound moves, MEMS start/stop/profile, path-offset, focus-adjustment start) -
+            # see controller_window.py and the per-tab widgets, which filter by reply type
+            # themselves rather than this class growing one named signal per message.
+            self.replyReceived.emit(msg.get_msg_reply_type(), msg.get_msg_payload())
+        else:
+            # Catch-all for every other COMM broadcast (e.g. none currently routed
+            # elsewhere) - same generic-signal rationale as replyReceived above.
+            self.broadcastReceived.emit(msg_type, msg.get_msg_payload())
 
-    def send_mems_run_profile(self) -> None:
+    def send_mems_run_profile(self, payload: dict | None = None) -> None:
         """Fire-and-forget, mirrors DOVER_UI/Windows/main_window.py:889-894
         (send_mems_run_profile). Programs the scanning-mirror sine driver on the
         controller and marks mems_profile_loaded there; without this, a real scan
         either rides on whatever profile a previously-run DOVER_UI instance left
         behind, or is rejected outright (cMEMS_PROFILE_NOT_LOADED) on a fresh
         controller process. No reply is defined for this message on the controller
-        side, so this doesn't block waiting for one."""
-        payload = {
-            ic.cTAB_SENDER: "region_designer",
-            ic.cENABLE_DIGITAL_OUT: False,
-            ic.cX_SIGNAL_FORM: True,  # sine, not DC
-            ic.cY_VOLTAGE: _MEMS_Y_VOLTAGE,
-            ic.cX_AMPLITUDE: _MEMS_X_AMPLITUDE,
-            ic.cX_FREQUENCY: _MEMS_X_FREQUENCY,
-            ic.cCUTOFF: _MEMS_CUTOFF,
-            ic.cV_DIFFERENCE: _MEMS_V_DIFFERENCE,
-            ic.cSAMPLING_RATE: _MEMS_SAMPLING_RATE,
-            ic.cSAMPLE_POINTS: _MEMS_SAMPLE_POINTS,
-            ic.cRED_LASER_ON: False,
-            ic.cZ_POSITION: 0.0,
-        }
+        side, so this doesn't block waiting for one.
+
+        payload=None (the only way this was ever called before the Dover Controller
+        window's MEMS tab existed) keeps today's fixed-default scan-time behavior,
+        sent once from connect_to_controller(). The MEMS tab instead passes its own
+        live slider values here for its "Set MEMS run profile" button."""
+        if payload is None:
+            payload = {
+                ic.cTAB_SENDER: "region_designer",
+                ic.cENABLE_DIGITAL_OUT: False,
+                ic.cX_SIGNAL_FORM: True,  # sine, not DC
+                ic.cY_VOLTAGE: _MEMS_Y_VOLTAGE,
+                ic.cX_AMPLITUDE: _MEMS_X_AMPLITUDE,
+                ic.cX_FREQUENCY: _MEMS_X_FREQUENCY,
+                ic.cCUTOFF: _MEMS_CUTOFF,
+                ic.cV_DIFFERENCE: _MEMS_V_DIFFERENCE,
+                ic.cSAMPLING_RATE: _MEMS_SAMPLING_RATE,
+                ic.cSAMPLE_POINTS: _MEMS_SAMPLE_POINTS,
+                ic.cRED_LASER_ON: False,
+                ic.cZ_POSITION: 0.0,
+            }
         cmd = TIsMsg.create_cmd_msg(ic.cSET_MEMS_RUN_PROFILE_MSG, ic.CTL_TARGET)
         cmd.add_msg_payload(payload)
         cmd.send_q_destroy()
@@ -183,6 +222,220 @@ class ControllerBridge(QObject):
 
     def is_busy(self) -> bool:
         return self._busy
+
+    # ------------------------------------------------------------------
+    # Dover Controller window support (dover_controller/) - fire-and-forget
+    # commands for the 8 tabs ported from DOVER_UI/Windows/main_window.py. None
+    # of these participate in _busy (DOVER_UI itself doesn't gate most of them
+    # on anything but its own in_motion flag, which the tabs track themselves
+    # via controller_window.py's set_motion_locked) - see the refactor plan's
+    # "accepted risks" section for the reply-correlation caveat this inherits.
+
+    def send_param(self, msg_type: str, target: str, payload: dict) -> None:
+        """Generic fire-and-forget single-message param push, for the many DOVER_UI
+        System Config / MEMS-slider / Laser-power commands that are just one
+        create_cmd_msg().add_msg_payload().send_q_destroy() each (see
+        dover_controller/system_config_tab.py etc.) - keeps TIsMsg construction
+        confined to this module without one near-identical named wrapper per
+        message. Not for anything that waits for a reply or needs _busy guarding.
+        An empty payload is sent with no payload object at all (DOVER_UI's own
+        no-parameter commands, e.g. handle_stage_reset, never call add_msg_payload
+        either) rather than an empty dict, to match exactly."""
+        msg = TIsMsg.create_cmd_msg(msg_type, target)
+        if payload:
+            msg.add_msg_payload(payload)
+        msg.send_q_destroy()
+
+    # --- Manual Moves tab ---
+
+    def start_compound_move(self, x_speed: float, y_speed: float, z_speed: float) -> None:
+        """Mirrors MainWindow.start_compound_moves (main_window.py:497-514): moves X/Y/Z
+        together at the given per-axis speeds, no target position (jog-style, stops when
+        the stage hits its limit or another move/reset is sent)."""
+        payload = {
+            ic.cTAB_SENDER: "region_designer",
+            ic.cX_SPEED_VAL: x_speed, ic.cY_SPEED_VAL: y_speed, ic.cZ_SPEED_VAL: z_speed,
+            ic.cX_ALT_SPEED_VAL: x_speed, ic.cY_ALT_SPEED_VAL: y_speed, ic.cZ_ALT_SPEED_VAL: z_speed,
+        }
+        self.send_param(ic.cSTART_COMPOUND_MOVE_MSG, ic.CTL_TARGET, payload)
+
+    def start_single_axis_move(self, axis: str, speed: float) -> None:
+        """Mirrors MainWindow.start_x_moves/start_y_moves/start_z_moves (main_window.py:
+        516-556, three nearly-identical functions collapsed into one here) - jog-style
+        single-axis move at the given speed, same no-target-position semantics as
+        start_compound_move. axis is 'x', 'y', or 'z'."""
+        msg_type, speed_key = {
+            "x": (ic.cSTART_X_MOVE_MSG, ic.cX_SPEED_VAL),
+            "y": (ic.cSTART_Y_MOVE_MSG, ic.cY_SPEED_VAL),
+            "z": (ic.cSTART_Z_MOVE_MSG, ic.cZ_SPEED_VAL),
+        }[axis]
+        self.send_param(msg_type, ic.CTL_TARGET, {ic.cTAB_SENDER: "region_designer", speed_key: speed})
+
+    def move_axis_absolute(self, axis: str, pos: float, speed: float) -> None:
+        """Mirrors MainWindow.move_stage_x_pm/move_stage_y_pm/move_stage_z_pm
+        (main_window.py:585-639) - a single-axis programmed (absolute position) move.
+        axis is 'x', 'y', or 'z'."""
+        msg_type, pos_key, speed_key = {
+            "x": (ic.cX_MOVE_PM_MSG, ic.cX_POS_PM, ic.cX_SPEED_VAL),
+            "y": (ic.cY_MOVE_PM_MSG, ic.cY_POS_PM, ic.cY_SPEED_VAL),
+            "z": (ic.cZ_MOVE_PM_MSG, ic.cZ_POS_PM, ic.cZ_SPEED_VAL),
+        }[axis]
+        self.send_param(msg_type, ic.CTL_TARGET, {ic.cTAB_SENDER: "region_designer", pos_key: pos, speed_key: speed})
+
+    def move_xyz_absolute(self, x: float, x_speed: float, y: float, y_speed: float,
+                           z: float, z_speed: float) -> None:
+        """Mirrors MainWindow.move_stages_pm (main_window.py:645-670) - all 3 axes to an
+        absolute position at once, each at its own speed."""
+        payload = {
+            ic.cTAB_SENDER: "region_designer",
+            ic.cX_POS_PM: x, ic.cX_SPEED_VAL: x_speed,
+            ic.cY_POS_PM: y, ic.cY_SPEED_VAL: y_speed,
+            ic.cZ_POS_PM: z, ic.cZ_SPEED_VAL: z_speed,
+        }
+        self.send_param(ic.cMOVE_PM_MSG, ic.CTL_TARGET, payload)
+
+    def reset_stage(self) -> None:
+        """Mirrors MainWindow.handle_stage_reset (main_window.py:774-779) - moves to
+        the load position; the "Reset Stage" button."""
+        self.send_param(ic.cRESET_STAGE_MSG, ic.CTL_TARGET, {})
+
+    def request_position_update(self) -> None:
+        """Mirrors MainWindow.get_current_position_values (main_window.py:229-231) -
+        fire-and-forget request; the reply (cPOSITION_UPDATE_MSG, fields
+        cX/Y/Z_POSITION_READ) arrives via replyReceived, not returned here."""
+        self.send_param(ic.cPOSITION_UPDATE_MSG, ic.CTL_TARGET, {})
+
+    def discover_stages(self) -> None:
+        """Mirrors Utilities/utilities.py's discover_stages - part of the "Connect"
+        button (DOVER_UI's connect() also calls discover_mems/request_internal_config,
+        done as 3 separate bridge calls here instead of one combined method, so each
+        tab can trigger just the one it owns if it ever needs to)."""
+        self.send_param(ic.cDISCOVER_STAGES_MSG, ic.CTL_TARGET, {})
+
+    def discover_mems(self) -> None:
+        """Mirrors Utilities/utilities.py's discover_mems - see discover_stages."""
+        self.send_param(ic.cDISCOVER_MEMS, ic.CTL_TARGET, {})
+
+    def request_internal_config(self) -> None:
+        """Mirrors Utilities/utilities.py's ask_for_internal_config: fans the same
+        cSEND_INTERNAL_CONFIG_UPDATE_MSG request out to all 4 modules that answer it
+        (CTL_TARGET, RECONSTRUCTION_TARGET, STITCHER_TARGET, SAFE_MON_TARGET) - each
+        replies with its own cINTERNAL_CONFIG_VALUES_MSG broadcast (routed via
+        broadcastReceived, keyed by the "_sender" field _handle_message folds in),
+        which is how the System Config tab resyncs its checkboxes/radios to whatever
+        the backend actually has configured."""
+        msg = TIsMsg.create_cmd_msg(ic.cSEND_INTERNAL_CONFIG_UPDATE_MSG, ic.CTL_TARGET)
+        msg.send_q()
+        msg.add_msg_target(ic.RECONSTRUCTION_TARGET)
+        msg.send_q()
+        msg.add_msg_target(ic.STITCHER_TARGET)
+        msg.send_q()
+        msg.add_msg_target(ic.SAFE_MON_TARGET)
+        msg.send_q_destroy()
+
+    # --- Section Moves tab ---
+
+    def move_to_section(self, row: int, col: int, position_mode: str, scan_offset: int) -> None:
+        """Mirrors MainWindow.execute_section_move (main_window.py:722-745).
+        position_mode is one of DOVER_UI's own section-position radio-group values
+        (e.g. project_constants.SCAN_START_R/SCAN_END_R/TOP_LEFT_CORNER_R/
+        BOTTOM_RIGHT_CORNER_R/FOCUS_START_R/FOCUS_END_R, already present in this
+        project's Constants/project_constants.py) - passed straight through
+        unmodified, same as DOVER_UI's own self.section_position."""
+        payload = {
+            ic.cTAB_SENDER: "region_designer",
+            ic.cSECTION_ROW: row, ic.cSECTION_COL: col,
+            ic.cSECTION_POSITION: position_mode, ic.cSCAN_OFFSET: scan_offset,
+        }
+        self.send_param(ic.cSECTION_MOVE_MSG, ic.CTL_TARGET, payload)
+
+    # --- Calibration tab ---
+
+    def set_path_offset(self, offset_row: int, offset_col: int) -> None:
+        """Mirrors MainWindow.send_path_offset_point (main_window.py:217-226) - the
+        Calibration tab's "Set path grid offset" button; distinct message from
+        set_anchor (cSET_ANCHOR_POINT_MSG, already implemented above)."""
+        payload = {ic.cTAB_SENDER: "region_designer", ic.cSECTION_ROW: offset_row, ic.cSECTION_COL: offset_col}
+        self.send_param(ic.cSET_PATH_OFFSET_MSG, ic.CTL_TARGET, payload)
+
+    # --- Focus tab ---
+
+    def send_focus_position_adjustment(self, payload: dict) -> None:
+        """Mirrors MainWindow.handle_focus_tab_events' cZ_AXIS_POSITION_ADJUSTMENT sends
+        (main_window.py:954-994, live-adjustment-while-in-motion and the "Send Update"/
+        "Zero" buttons) - fire-and-forget, streamed while the Focus tab's Z slider moves.
+        payload shape matches create_focus_calibration_payload (main_window.py:167-200):
+        {cZ_POSITION, cZ_SPEED_VAL, cX_POS_PM, cY_POS_PM, cSECTION_ROW, cSECTION_COL,
+        cMOTION_SELECTION, cPOSITION_SELECTION} - built by the tab itself since it alone
+        knows whether it's in section-motion or absolute-position mode."""
+        self.send_param(ic.cZ_AXIS_POSITION_ADJUSTMENT, ic.CTL_TARGET, payload)
+
+    def start_focus_adjustment_motion(self, payload: dict) -> None:
+        """Mirrors the "START X Axis Focus Moves" branch of handle_focus_tab_events
+        (main_window.py:980-994) - same payload shape as send_focus_position_adjustment."""
+        self.send_param(ic.cSTART_FOCUS_ADJUSTMENT, ic.CTL_TARGET, payload)
+
+    def stop_focus_adjustment_motion(self) -> None:
+        """Mirrors the "STOP X Axis Focus Moves" branch of handle_focus_tab_events
+        (main_window.py:980-986)."""
+        self.send_param(ic.cSTOP_FOCUS_ADJUSTMENT, ic.CTL_TARGET, {})
+
+    # --- MEMS tab ---
+    # send_mems_run_profile (above) also serves the MEMS tab's "Set MEMS run profile"
+    # button, passing its own live payload instead of the fixed scan-time default.
+
+    def start_mems_test_pattern(self, payload: dict) -> None:
+        """Mirrors MainWindow.send_laser_reset_start_stop_msg's start branch
+        (main_window.py:828-839) - MEMS testing with the red laser only; distinct
+        code path/button from send_mems_run_profile (DOVER_UI has two separate
+        frames/buttons for these). payload shape matches MainWindow.payload (main_window.py
+        :349-362): cTAB_SENDER, cENABLE_DIGITAL_OUT, cX_SIGNAL_FORM, cY_VOLTAGE,
+        cX_AMPLITUDE, cX_FREQUENCY, cCUTOFF, cV_DIFFERENCE, cSAMPLING_RATE,
+        cSAMPLE_POINTS, cRED_LASER_ON, cZ_POSITION."""
+        self.send_param(ic.cRESET_START_MEMS, ic.CTL_TARGET, payload)
+
+    def stop_mems_test_pattern(self) -> None:
+        """Mirrors send_laser_reset_start_stop_msg's stop branch - no payload."""
+        self.send_param(ic.cRESET_STOP_MEMS, ic.CTL_TARGET, {})
+
+    def update_mems_y_voltage(self, y_voltage: float, x_amplitude: float) -> None:
+        """Mirrors MainWindow.send_y_voltage (main_window.py:794-799) - live push while
+        the MEMS test pattern is running; DOVER_UI always sends both current values
+        together regardless of which slider moved, reproduced as-is here."""
+        self.send_param(ic.cUPDATE_Y_VOLTAGE, ic.CTL_TARGET, {ic.cY_VOLTAGE: y_voltage, ic.cX_AMPLITUDE: x_amplitude})
+
+    def update_mems_x_amplitude(self, y_voltage: float, x_amplitude: float) -> None:
+        """Mirrors MainWindow.send_x_voltage (main_window.py:801-806) - see
+        update_mems_y_voltage for why both values are always sent together."""
+        self.send_param(ic.cUPDATE_X_AMPLITUDE, ic.CTL_TARGET, {ic.cY_VOLTAGE: y_voltage, ic.cX_AMPLITUDE: x_amplitude})
+
+    def update_mems_sampling_rate(self, rate: float) -> None:
+        """Mirrors MainWindow.send_sampling_rate (main_window.py:816-820)."""
+        self.send_param(ic.cUPDATE_SAMPLING_RATE, ic.CTL_TARGET, {ic.cSAMPLING_RATE: rate})
+
+    def update_mems_v_difference(self, v: float) -> None:
+        """Mirrors MainWindow.send_v_difference_rate (main_window.py:822-826)."""
+        self.send_param(ic.cUPDATE_V_DIFFERENCE, ic.CTL_TARGET, {ic.cV_DIFFERENCE: v})
+
+    def toggle_red_laser_without_mems(self) -> None:
+        """Mirrors module-level toggle_red_laser (main_window.py:131-133) - "Toggle Red
+        Laser" button, independent of the MEMS test pattern."""
+        self.send_param(ic.cTOGGLE_ON_RED_LASER_WO_MEMS, ic.CTL_TARGET, {})
+
+    # --- Lasers tab (OXXIUS only - GOJI/Amplitude is direct Modbus, see goji_controller.py) ---
+
+    def oxxius_laser_on(self) -> None:
+        """Mirrors MainWindow.oxxius_on (main_window.py:1557-1560)."""
+        self.send_param(ic.cSTART_OXXIUS_LASER, ic.CTL_TARGET, {})
+
+    def oxxius_laser_off(self) -> None:
+        """Mirrors MainWindow.oxxius_off (main_window.py:1562-1565)."""
+        self.send_param(ic.cSTOP_OXXIUS_LASER, ic.CTL_TARGET, {})
+
+    def set_oxxius_power(self, scan_power: int, focus_power: int) -> None:
+        """Mirrors MainWindow.oxxius_set_power (main_window.py:1567-1574)."""
+        payload = {ic.cDETECTION_LASER_SCAN_POWER_LEVEL: scan_power, ic.cDETECTION_LASER_FOCUS_POWER_LEVEL: focus_power}
+        self.send_param(ic.cSET_OXXIUS_POWER_MSG, ic.CTL_TARGET, payload)
 
     def wait_for_reconstruction_off(self, row: int, col: int, timeout: float) -> bool:
         """Blocks up to timeout for the controller's reconstruction-off
