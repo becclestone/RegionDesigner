@@ -158,7 +158,7 @@ class SectionCanvas(QGraphicsView):
         self.region_progress: dict[int, tuple[int, int]] = {}  # region_id -> (points done, total)
         self.section_activity: dict[Section, str] = {}  # (row,col) -> "scanning" | "reconstructing" | "reconstructed"
         self.show_grid = False  # overlay of section-grid lines, toggled from the toolbar
-        self.snap_focus_points_on_release = False  # see set_snap_focus_points_on_release
+        self.snap_focus_points_on_release = True  # see set_snap_focus_points_on_release
 
         # Redo/correction (post-hoc): sections marked for a targeted rescan, and the
         # brush/pick modes that populate them - see main_window's "Redo / Correct
@@ -324,6 +324,10 @@ class SectionCanvas(QGraphicsView):
         painted/assigned to one yet. Double-clicking an existing marker does
         nothing special here (falls through to Qt's normal handling).
 
+        The new point is placed at the exact center of the clicked section
+        (rounded there, same as snap-to-grid) rather than at the free-form
+        clicked pixel - it can still be dragged to a free-form position afterward.
+
         Note: while draw_mode is still True (regions not yet compiled), Qt's own
         double-click sequence still delivers the first press/release as a
         normal click first - see mousePressEvent - so this can also paint or
@@ -334,7 +338,8 @@ class SectionCanvas(QGraphicsView):
             if not isinstance(clicked_item, FocusPointItem):
                 scene_pos = self.mapToScene(event.position().toPoint())
                 row, col = geom.point_to_section_center_f(scene_pos.x(), scene_pos.y(), self.anchor, self.zoom)
-                region_id = self.region_of.get((int(round(row)), int(round(col))))
+                row, col = round(row), round(col)
+                region_id = self.region_of.get((int(row), int(col)))
                 self.focusPointAddRequested.emit(region_id, row, col)
                 event.accept()
                 return

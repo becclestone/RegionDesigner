@@ -1,9 +1,6 @@
 import glob
 import os
-import shutil
-import time
 
-from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QMainWindow, QToolBar, QSpinBox, QDoubleSpinBox, QPushButton, QLabel, QMessageBox, QFileDialog, QCheckBox
 )
@@ -15,11 +12,8 @@ from goji_scheduler import GojiScheduler
 import confirmation_scan
 import autofocus_log
 import region_clustering as clustering
-import scan_archive
-import scan_finalize
 import scan_path_export
 import scan_record_import
-import session_state
 from stage_calibration import StageCalibration
 from autofocus_client import AutofocusSequenceWorker
 from focus_review_dialog import FocusReviewDialog
@@ -31,23 +25,6 @@ from region_scan import RegionScanWorker
 _DEFAULT_TARGET_REGION_SIZE = 100
 _DEFAULT_FOCUS_POINTS_PER_REGION = 4
 _DEFAULT_AF_Z_START = -0.010
-# A region scan's archive-to-aggregate-batch move waits for every section's
-# reconstruction-off message (see _on_section_reconstructing); _recheck_tracker_files
-# is the fallback for a message that never arrives, and re-checks the actual NR
-# file on disk rather than guessing a fixed wait time.
-_RECON_POLL_INTERVAL_MS = 15 * 1000
-# Reconstruction finishes sections in the same order they were scanned (the
-# controller processes its capture queue in order), so a tracker's "remaining"
-# list is kept in that same order and only its FRONT ever needs checking - once
-# it isn't there yet, nothing behind it will be either. Sections normally
-# finish no more than about this far apart; once it's been longer than that
-# since the last one arrived (live broadcast or found on disk), assume no more
-# are coming rather than wait on a fixed total budget that can't adapt to how
-# fast reconstruction actually is - see _recheck_tracker_files/
-# _on_section_reconstructing for where this is applied, and
-# _auto_pipeline_wait_tracker for why it also needs to release Auto Run All
-# Regions' hold on the next region rather than potentially wait forever.
-_RECON_GAP_TIMEOUT_S = 60
 
 # DOVER_UI is a sibling checkout that already carries the operator's calibration
 # (Stage Calibration tab, saved to its saved-calibration/ folder). Auto-loading its
@@ -64,25 +41,6 @@ def _find_default_calibration_path() -> str | None:
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
-
-
-# Fixed basename (original extension preserved) RegionDesigner copies its own raw
-# background snap to under an aggregate batch root once one exists - see
-# _on_start_aggregate_clicked. The snap itself is usually taken before "Start New
-# Aggregate Batch" (to paint regions against), so wherever the camera driver first
-# wrote it may be a scratch/staging path that doesn't outlive the session; copying
-# it alongside the rest of that batch's data means both "Open Previous Scan..."
-# (session.json's background_image_path) and "Load Scan Record" (see
-# _find_background_snap below) can reliably recover the exact image regions were
-# painted against, instead of depending on an external path or (worse) DOVER_UI's
-# own slide.tif, which is a scaled-down screenshot of its display window, not the
-# raw registered image - rotating/cropping it again would double-transform it.
-_BACKGROUND_SNAP_BASENAME = "background_snap"
-
-
-def _find_background_snap(aggregate_root: str) -> str | None:
-    matches = glob.glob(os.path.join(aggregate_root, _BACKGROUND_SNAP_BASENAME + ".*"))
-    return matches[0] if matches else None
 
 
 class RegionDesignerWindow(QMainWindow):
@@ -117,30 +75,18 @@ class RegionDesignerWindow(QMainWindow):
 
         self.calibration: StageCalibration | None = None
         self.region_focus_points: dict[int, list[tuple[float, float, float]]] = {}  # region_id -> [(row,col,z)]
-        self.region_planes: dict[int, RegionPlaneFit] = {}  # region_id -> its last Fit Region Plane result
         self.section_z: dict[tuple[int, int], float] = {}
-        self._af_worker = None
-        self._af_region_id: int | None = None
-        self._af_region_items: list = []
-        self._af_log_path: str | None = None  # this region's staged autofocus_log.json, see autofocus_log.py
-        # True for the whole span of a running AutofocusSequenceWorker, not just
-        # while a hardware call is actually in flight (bridge.is_busy() drops
-        # back to False in the gaps between the worker's individual calls) - see
-        # _focus_points_locked, which needs the former to safely gate
-        # double-click-add/right-click-remove against a sequence that's
-        # currently indexing into the canvas's point list by position.
-        self._af_sequence_active = False
-        self._review_dialog: FocusReviewDialog | None = None
 
-        # Global Focus Search (second fitting mode): autofocus every compiled
-        # region's own focus points, then RANSAC-fit ONE plane across all of
-        # them (instead of one plane per region) - RANSAC's own inlier/outlier
-        # classification (region_plane_fit.RegionPlaneFit.inlier_mask) flags
-        # points inconsistent with the sample's overall tilt (a fold, dust,
-        # etc.). Those flagged sections are then kept out of the per-region
-        # focus-point placement and per-region plane fits below, rather than
-        # letting a bad point silently skew one region's local fit. Requires
-        # Compile Regions to have already placed the points this runs over.
+        # Global Focus Search: autofocus every compiled region's focus points
+        # (or just the newly-added/unconfirmed ones - see
+        # _on_run_autofocus_new_points_clicked), then RANSAC-fit ONE plane
+        # across all of them - RANSAC's own inlier/outlier classification
+        # (region_plane_fit.RegionPlaneFit.inlier_mask) flags points
+        # inconsistent with the sample's overall tilt (a fold, dust, etc.).
+        # Those flagged sections are then kept out of the per-region
+        # focus-point placement, rather than letting a bad point silently skew
+        # the fit. Requires Compile Regions to have already placed the points
+        # this runs over.
         self.global_focus_points: list[tuple[float, float, float]] = []  # confirmed (row, col, z)
         self.global_outlier_sections: set[tuple[int, int]] = set()  # grid cells RANSAC flagged as outliers
         self.global_plane: RegionPlaneFit | None = None
@@ -148,12 +94,19 @@ class RegionDesignerWindow(QMainWindow):
         self._global_af_worker = None
         self._global_af_items: list = []
         self._global_af_log_path: str | None = None
-        self._global_af_sequence_active = False  # see _af_sequence_active above
+        # True for the whole span of a running AutofocusSequenceWorker, not just
+        # while a hardware call is actually in flight (bridge.is_busy() drops
+        # back to False in the gaps between the worker's individual calls) - see
+        # _focus_points_locked, which needs this to safely gate
+        # double-click-add/right-click-remove against a sequence that's
+        # currently indexing into the canvas's point list by position.
+        self._global_af_sequence_active = False
         self._global_review_dialog: FocusReviewDialog | None = None
-        # Set by _on_run_global_focus_plane_fitting_clicked, consumed by
-        # _on_global_review_dialog_finished - chains straight into
-        # _on_fit_global_plane_clicked once the operator confirms the search,
-        # so the one-click button covers both Global Focus Search steps.
+        # Set by _on_run_global_focus_plane_fitting_clicked/
+        # _on_run_autofocus_new_points_clicked, consumed by
+        # _on_global_review_dialog_finished - chains straight into fitting/
+        # updating the global plane once the operator confirms the search, so
+        # the one-click buttons cover both Global Focus Search steps.
         self._global_auto_fit_after_search = False
 
         # Manual per-point overrides from shift-clicking a marker (see
@@ -174,54 +127,19 @@ class RegionDesignerWindow(QMainWindow):
         self._plane_review_highlighted_item = None
 
         self._scan_worker = None
-        self._scanning_region_id: int | None = None
-        self._scan_existing_run_folders: set[str] = set()
+        self._scanning_region_id: int | str | None = None
         # "Send Scan Path to Controller" progress - cells still awaiting a
         # sectionScanning off-edge, and the path's total row count for the
         # status label's "N/M" count. None when no full-path send is in flight.
         self._full_path_scan_remaining: set[tuple[int, int]] | None = None
         self._full_path_scan_total: int = 0
-        self._aggregate_root: str | None = None
-        # Last snap image path (see _on_image_ready) - saved into session.json
-        # as a best-effort visual reference for "Open Previous Scan...", since
-        # a snap always comes from live hardware and there's no other way to
-        # get the same background back after a restart.
-        self._last_snap_path: str | None = None
-        # One entry per region scan whose output is still being archived (or is
-        # eligible to be, once its aggregate batch is known) - see
-        # _start_region_scan/_on_region_scan_finished/_on_section_reconstructing/
-        # _maybe_archive_tracker. More than one can be in flight at once, since
-        # reconstruction for one region's last sections can still be catching up
-        # (see run_path_scan's docstring) after the next region's scan has
-        # already started.
-        self._scan_recon_trackers: list[dict] = []
-        self._active_scan_tracker: dict | None = None
-
-        # "Auto Run All Regions": autofocus -> confirm -> fit plane -> scan,
-        # then advance to the next region, repeated unattended for every region
-        # in region_ids order - see _run_auto_pipeline_region/_advance_auto_pipeline.
-        self._auto_pipeline_active = False
-        self._auto_pipeline_region_ids: list[int] = []
-        self._auto_pipeline_index: int = 0
-        # Set (to a _scan_recon_trackers entry) by _on_region_scan_finished right
-        # after a region's scan completes, while the pipeline is active - holds
-        # the pipeline from starting the next region's autofocus/confirmation
-        # captures until every section in that tracker reports reconstruction-
-        # off (see _maybe_archive_tracker, the single place that clears this and
-        # advances). Running the next region's hardware ops while the previous
-        # one's images are still reconstructing risks a real hardware conflict
-        # (same physical stage/camera resources) - see region_scan.py's
-        # module docstring for why reconstruction can otherwise lag behind.
-        self._auto_pipeline_wait_tracker: dict | None = None
 
         # Redo/correction (post-hoc): autofocus + contrast-confirm state for the
         # single redo focus point (see canvas.redo_focus_point_item), and the Z it
-        # confirms to once accepted - mirrors _af_*/region_focus_points, but for
+        # confirms to once accepted - mirrors region_focus_points, but for
         # exactly one point shared across every section marked for redo, not a
         # per-region plane fit. "Redo" (a string, not an int) is used as the
-        # region_id/tracker key everywhere a real region scan would use an int, so
-        # it archives into its own Region_Redo/ folder alongside the rest of the
-        # active aggregate batch without colliding with any real region's id.
+        # region_id key everywhere a real region scan would use an int.
         self._redo_af_worker = None
         self._redo_af_item = None  # the canvas.redo_focus_point_item this run is for
         self._redo_af_log_path: str | None = None
@@ -309,6 +227,7 @@ class RegionDesignerWindow(QMainWindow):
         self.snap_focus_points_on_release_check.toggled.connect(
             self.canvas.set_snap_focus_points_on_release
         )
+        self.snap_focus_points_on_release_check.setChecked(True)
         toolbar.addWidget(self.snap_focus_points_on_release_check)
 
         toolbar.addSeparator()
@@ -342,11 +261,15 @@ class RegionDesignerWindow(QMainWindow):
         next_region_btn.clicked.connect(lambda: self.region_id_spin.stepBy(1))
         toolbar.addWidget(next_region_btn)
 
-        # Second row: the autofocus/plane-fit/scan pipeline controls - kept on
-        # their own toolbar (via addToolBarBreak) rather than crammed onto the
-        # first row, which was getting too wide to fit on screen.
+        # Second row: the scan-planning pipeline. The whole per-region
+        # autofocus/plane-fit/scan workflow (and the aggregate-batch archiving
+        # it fed) was removed in favor of a single global flow: compile
+        # regions, run the global focus search to filter/fit points across the
+        # whole sample, add/autofocus any new points as needed, re-review, then
+        # send the resulting scan path to the controller for one real
+        # closed-loop scan.
         self.addToolBarBreak()
-        toolbar2 = QToolBar("Autofocus/Scan Pipeline", self)
+        toolbar2 = QToolBar("Scan Planning Pipeline", self)
         self.addToolBar(toolbar2)
 
         toolbar2.addWidget(QLabel(" AF Z start (initial guess): "))
@@ -357,113 +280,79 @@ class RegionDesignerWindow(QMainWindow):
         self.af_z_start_spin.setValue(_DEFAULT_AF_Z_START)
         toolbar2.addWidget(self.af_z_start_spin)
 
-        self.run_autofocus_btn = QPushButton("Run Autofocus for Region")
-        self.run_autofocus_btn.clicked.connect(self._on_run_autofocus_clicked)
-        toolbar2.addWidget(self.run_autofocus_btn)
-
-        self.auto_run_autofocus_btn = QPushButton("Auto Run Autofocus for Region")
-        self.auto_run_autofocus_btn.setToolTip(
-            "Runs autofocus for the region, then automatically confirms every point via a real scan "
-            "(Auto Search, picking each point's highest-contrast capture) using the fitted peak as the starting Z."
+        self.run_global_focus_plane_fitting_btn = QPushButton("Run Global Focus Plane Fitting")
+        self.run_global_focus_plane_fitting_btn.setToolTip(
+            "One-click: runs autofocus over every compiled region's focus points, then - once you "
+            "confirm the search in the review dialog - automatically fits (or, if a plane's already "
+            "been fit, updates) the global RANSAC plane and flags outliers. Requires Compile Regions first."
         )
-        self.auto_run_autofocus_btn.clicked.connect(self._on_auto_run_autofocus_clicked)
-        toolbar2.addWidget(self.auto_run_autofocus_btn)
+        self.run_global_focus_plane_fitting_btn.clicked.connect(self._on_run_global_focus_plane_fitting_clicked)
+        toolbar2.addWidget(self.run_global_focus_plane_fitting_btn)
 
-        self.auto_finish_checkbox = QCheckBox("Auto-finish when confirmed")
-        self.auto_finish_checkbox.setToolTip(
-            "Checked: Auto Run also finishes the region automatically once every point is confirmed.\n"
-            "Unchecked: Auto Run stops there so you can do a final manual review before clicking "
-            "'Done Reviewing This Region' yourself."
+        self.run_autofocus_new_points_btn = QPushButton("Autofocus New Points")
+        self.run_autofocus_new_points_btn.setToolTip(
+            "Runs autofocus on only the focus points that haven't been confirmed yet - new points you "
+            "added (double-click a compiled region) after a Global Focus Plane Fitting run, or a point "
+            "that previously failed. Once confirmed, automatically fits (first time) or updates (if a "
+            "plane already exists) the global plane - review the result with 'Review Global Plane Fit'."
         )
-        toolbar2.addWidget(self.auto_finish_checkbox)
-
-        self.fit_plane_btn = QPushButton("Fit Region Plane")
-        self.fit_plane_btn.clicked.connect(self._on_fit_plane_clicked)
-        toolbar2.addWidget(self.fit_plane_btn)
-
-        self.review_region_plane_fit_btn = QPushButton("Review Region Plane Fit")
-        self.review_region_plane_fit_btn.setToolTip(
-            "Lists every focus point in the current region - click through them to see each one's focus "
-            "curve and how far it sits from the fitted plane, with its marker highlighted red on the "
-            "canvas so it can be found on the sample. Also opens (pre-selected to the clicked point) by "
-            "shift+clicking any region marker."
-        )
-        self.review_region_plane_fit_btn.clicked.connect(self._on_review_region_plane_fit_clicked)
-        toolbar2.addWidget(self.review_region_plane_fit_btn)
-
-        self.scan_region_btn = QPushButton("Scan Region")
-        self.scan_region_btn.setToolTip(
-            "Submits every painted section in this region, with its Fit Region Plane Z, as one real "
-            "multi-section scan. Run Fit Region Plane for this region first.\n"
-            "Known tradeoff: this scan is open-loop (drives straight to the precomputed Z, no live "
-            "refocus), unlike DOVER_UI's own Image-Path Scan button which live-autofocuses during the "
-            "scan - so results can look softer than a real DOVER_UI scan if the plane fit didn't "
-            "perfectly capture the tissue's tilt/drift. See region_scan.py's module docstring."
-        )
-        self.scan_region_btn.clicked.connect(self._on_scan_region_clicked)
-        toolbar2.addWidget(self.scan_region_btn)
+        self.run_autofocus_new_points_btn.clicked.connect(self._on_run_autofocus_new_points_clicked)
+        toolbar2.addWidget(self.run_autofocus_new_points_btn)
 
         toolbar2.addSeparator()
-
-        self.auto_run_all_regions_btn = QPushButton("Auto Run All Regions")
-        self.auto_run_all_regions_btn.setToolTip(
-            "Fully automated: for every region (in order), runs autofocus, auto-confirms every point "
-            "via Auto Search, fits the region plane, then submits a real region scan - then moves on "
-            "to the next region and repeats until all regions are done. No per-region confirmation "
-            "prompts once started. Use 'Stop After Current Region' to halt between regions."
+        toolbar2.addWidget(QLabel(" Outlier threshold (mm, 0=auto): "))
+        self.global_outlier_threshold_spin = QDoubleSpinBox()
+        self.global_outlier_threshold_spin.setDecimals(4)
+        self.global_outlier_threshold_spin.setRange(0.0, 1.0)
+        self.global_outlier_threshold_spin.setSingleStep(0.001)
+        self.global_outlier_threshold_spin.setValue(0.0)
+        self.global_outlier_threshold_spin.setToolTip(
+            "Max perpendicular distance (mm) from the fitted plane for a point to count as an inlier. "
+            "0 lets RANSAC pick its own threshold automatically."
         )
-        self.auto_run_all_regions_btn.clicked.connect(self._on_auto_run_all_regions_clicked)
-        toolbar2.addWidget(self.auto_run_all_regions_btn)
+        toolbar2.addWidget(self.global_outlier_threshold_spin)
 
-        self.stop_auto_pipeline_btn = QPushButton("Stop After Current Region")
-        self.stop_auto_pipeline_btn.setEnabled(False)
-        self.stop_auto_pipeline_btn.clicked.connect(self._on_stop_auto_pipeline_clicked)
-        toolbar2.addWidget(self.stop_auto_pipeline_btn)
+        self.fit_global_plane_btn = QPushButton("Fit Global RANSAC Plane / Find Outliers")
+        self.fit_global_plane_btn.setToolTip(
+            "RANSAC-fits one plane across every confirmed focus point and flags (orange) whichever "
+            "points don't fit it - candidates for a fold, dust, or other local defect. Confirm a focus "
+            "search first. Updates every compiled section's Z from the fit."
+        )
+        self.fit_global_plane_btn.clicked.connect(self._on_fit_global_plane_clicked)
+        toolbar2.addWidget(self.fit_global_plane_btn)
+
+        self.update_global_plane_btn = QPushButton("Update Global Plane")
+        self.update_global_plane_btn.setToolTip(
+            "Re-fits the global plane the same way Fit Global RANSAC Plane does (RANSAC needs every "
+            "current point to produce a valid plane, so the fit itself always uses all of them), but "
+            "only pushes a new Z for sections whose focus point is new or changed since the last fit/"
+            "update - so the rest of the sample's Z isn't disturbed just to account for a few added or "
+            "moved points. Requires an initial Fit Global RANSAC Plane first."
+        )
+        self.update_global_plane_btn.clicked.connect(self._on_update_global_plane_clicked)
+        toolbar2.addWidget(self.update_global_plane_btn)
+
+        self.review_global_plane_fit_btn = QPushButton("Review Global Plane Fit")
+        self.review_global_plane_fit_btn.setToolTip(
+            "Lists every compiled focus point - click through them to see each one's focus curve and "
+            "how far it sits from the global plane, with its marker highlighted red on the canvas so it "
+            "can be found on the sample. Also opens (pre-selected to the clicked point) by shift+clicking "
+            "any marker."
+        )
+        self.review_global_plane_fit_btn.clicked.connect(self._on_review_global_plane_fit_clicked)
+        toolbar2.addWidget(self.review_global_plane_fit_btn)
+
+        self.exclude_global_outliers_checkbox = QCheckBox("Exclude flagged outliers from region search")
+        self.exclude_global_outliers_checkbox.setChecked(True)
+        self.exclude_global_outliers_checkbox.setToolTip(
+            "When checked, sections flagged as outliers above are skipped when Compile Regions places "
+            "per-region focus points, and dropped from the plane fit if one already landed on one. "
+            "Shift+click a point's marker to manually include/exclude it regardless of this setting."
+        )
+        self.exclude_global_outliers_checkbox.toggled.connect(lambda _checked: self._refresh_focus_point_exclusion_visuals())
+        toolbar2.addWidget(self.exclude_global_outliers_checkbox)
 
         toolbar2.addSeparator()
-
-        self.reset_btn = QPushButton("Reset for New Scan")
-        self.reset_btn.setToolTip(
-            "Clears the canvas (background image, painted sections, regions, focus points), all "
-            "plane-fit Z values, and forgets the current aggregate batch, so a brand new sample can be "
-            "started from scratch. Nothing already written to disk is deleted or affected."
-        )
-        self.reset_btn.clicked.connect(self._on_reset_clicked)
-        toolbar2.addWidget(self.reset_btn)
-
-        self.open_previous_scan_btn = QPushButton("Open Previous Scan...")
-        self.open_previous_scan_btn.setToolTip(
-            "Picks an existing <timestamp>_aggregate folder under IMAGES_ROOT and makes it the active "
-            "aggregate batch again, so further scanning/archiving or Finalize Results can resume "
-            "targeting it. If it has a saved session.json (written automatically at Compile Regions/"
-            "confirm/Start New Aggregate Batch), also restores the canvas's painted regions and confirmed "
-            "focus points, and marks any region a hardware failure interrupted partway through its scan "
-            "as \"partial\" so Scan Region can resume just its missing sections. Older batches without a "
-            "saved session.json only get the aggregate-batch retarget, same as before."
-        )
-        self.open_previous_scan_btn.clicked.connect(self._on_open_previous_scan_clicked)
-        toolbar2.addWidget(self.open_previous_scan_btn)
-
-        toolbar2.addSeparator()
-
-        self.start_aggregate_btn = QPushButton("Start New Aggregate Batch")
-        self.start_aggregate_btn.setToolTip(
-            "Creates a new timestamped folder under IMAGES_ROOT and, from then on, files each "
-            "region's confirmed autofocus captures and full-region scan output into it as "
-            "Region_N/Focus_M and Region_N/Scan_data. Nothing is archived until this is clicked."
-        )
-        self.start_aggregate_btn.clicked.connect(self._on_start_aggregate_clicked)
-        toolbar2.addWidget(self.start_aggregate_btn)
-
-        self.finalize_results_btn = QPushButton("Finalize Results")
-        self.finalize_results_btn.setToolTip(
-            "Merges every scanned region's raw output into one Finalized/ folder under the aggregate "
-            "batch, with one combined scan_record.json - so this session's several per-region scans "
-            "can be handed to the post-processing pipeline as if they were one continuous scan. "
-            "Regions not yet scanned/confirmed are left out; run this again after scanning more."
-        )
-        self.finalize_results_btn.clicked.connect(self._on_finalize_results_clicked)
-        toolbar2.addWidget(self.finalize_results_btn)
 
         self.export_scan_path_btn = QPushButton("Export Scan Path...")
         self.export_scan_path_btn.setToolTip(
@@ -489,117 +378,53 @@ class RegionDesignerWindow(QMainWindow):
 
         self.cancel_scan_btn = QPushButton("Cancel Scan")
         self.cancel_scan_btn.setToolTip(
-            "Aborts whichever scan (Scan Region / Send Scan Path to Controller / Scan Redo "
-            "Sections) is currently running - sends the cancel command to both the controller "
-            "and reconstruction, same as DOVER_UI's Image-Path window's Cancel button, and "
-            "immediately re-enables the other hardware controls rather than waiting for the "
-            "controller's own reply."
+            "Aborts whichever scan (Send Scan Path to Controller / Scan Redo Sections) is currently "
+            "running - sends the cancel command to both the controller and reconstruction, same as "
+            "DOVER_UI's Image-Path window's Cancel button, and immediately re-enables the other hardware "
+            "controls rather than waiting for the controller's own reply."
         )
         self.cancel_scan_btn.setEnabled(False)
         self.cancel_scan_btn.clicked.connect(self._on_cancel_scan_clicked)
         toolbar2.addWidget(self.cancel_scan_btn)
 
-        # Third row: Global Focus Search - the alternative fitting mode. Its own
-        # row since it's a distinct workflow (fits one plane across every
-        # compiled region at once, instead of one plane per region), but it
-        # always runs on the region focus points Compile Regions placed - so
-        # Compile Regions must be run first.
-        self.addToolBarBreak()
-        toolbar3 = QToolBar("Global Focus Search (RANSAC outlier rejection)", self)
-        self.addToolBar(toolbar3)
-
-        self.run_global_focus_plane_fitting_btn = QPushButton("Run Global Focus Plane Fitting")
-        self.run_global_focus_plane_fitting_btn.setToolTip(
-            "One-click: runs autofocus over every compiled region's focus points, then - once you "
-            "confirm the search in the review dialog - automatically fits the global RANSAC plane and "
-            "flags outliers. Requires Compile Regions first."
-        )
-        self.run_global_focus_plane_fitting_btn.clicked.connect(self._on_run_global_focus_plane_fitting_clicked)
-        toolbar3.addWidget(self.run_global_focus_plane_fitting_btn)
-
-        toolbar3.addSeparator()
-        toolbar3.addWidget(QLabel(" Individual steps: "))
-
-        toolbar3.addWidget(QLabel(" Outlier threshold (mm, 0=auto): "))
-        self.global_outlier_threshold_spin = QDoubleSpinBox()
-        self.global_outlier_threshold_spin.setDecimals(4)
-        self.global_outlier_threshold_spin.setRange(0.0, 1.0)
-        self.global_outlier_threshold_spin.setSingleStep(0.001)
-        self.global_outlier_threshold_spin.setValue(0.0)
-        self.global_outlier_threshold_spin.setToolTip(
-            "Max perpendicular distance (mm) from the fitted plane for a point to count as an inlier. "
-            "0 lets RANSAC pick its own threshold automatically."
-        )
-        toolbar3.addWidget(self.global_outlier_threshold_spin)
-
-        self.fit_global_plane_btn = QPushButton("Fit Global RANSAC Plane / Find Outliers")
-        self.fit_global_plane_btn.setToolTip(
-            "RANSAC-fits one plane across every confirmed global focus point and flags (orange) whichever "
-            "points don't fit it - candidates for a fold, dust, or other local defect. Confirm the global "
-            "focus search first."
-        )
-        self.fit_global_plane_btn.clicked.connect(self._on_fit_global_plane_clicked)
-        toolbar3.addWidget(self.fit_global_plane_btn)
-
-        self.update_global_plane_btn = QPushButton("Update Global Plane")
-        self.update_global_plane_btn.setToolTip(
-            "Re-fits the global plane the same way Fit Global RANSAC Plane does (RANSAC needs every "
-            "current point to produce a valid plane, so the fit itself always uses all of them), but "
-            "only pushes a new Z for sections whose focus point is new or changed since the last fit/"
-            "update - so a Fit Region Plane result elsewhere isn't clobbered just to account for one "
-            "added or moved point. Requires an initial Fit Global RANSAC Plane first."
-        )
-        self.update_global_plane_btn.clicked.connect(self._on_update_global_plane_clicked)
-        toolbar3.addWidget(self.update_global_plane_btn)
-
-        self.review_global_plane_fit_btn = QPushButton("Review Global Plane Fit")
-        self.review_global_plane_fit_btn.setToolTip(
-            "Lists every point the last Global Focus Search ran on - click through them to see each one's "
-            "focus curve and how far it sits from the global plane, with its marker highlighted red on the "
-            "canvas so it can be found on the sample. Also opens (pre-selected to the clicked point) by "
-            "shift+clicking any global marker."
-        )
-        self.review_global_plane_fit_btn.clicked.connect(self._on_review_global_plane_fit_clicked)
-        toolbar3.addWidget(self.review_global_plane_fit_btn)
-
-        self.exclude_global_outliers_checkbox = QCheckBox("Exclude flagged outliers from region search")
-        self.exclude_global_outliers_checkbox.setChecked(True)
-        self.exclude_global_outliers_checkbox.setToolTip(
-            "When checked, sections flagged as outliers above are skipped when Compile Regions places "
-            "per-region focus points, and dropped from any per-region focus point that already landed on "
-            "one before Fit Region Plane runs. Shift+click a point's marker to manually include/exclude it "
-            "regardless of this setting."
-        )
-        self.exclude_global_outliers_checkbox.toggled.connect(lambda _checked: self._refresh_focus_point_exclusion_visuals())
-        toolbar3.addWidget(self.exclude_global_outliers_checkbox)
-
-        toolbar3.addSeparator()
-        toolbar3.addWidget(QLabel(
+        toolbar2.addSeparator()
+        toolbar2.addWidget(QLabel(
             " Shift+click a focus point to open its plane-fit review list (selecting a point there "
             "highlights it red on the canvas) - double-click a compiled region to add a point, "
             "right-click one to remove it. "
         ))
 
-        # Fourth row: Redo/Correct Scans (post-hoc) - load a previously finalized
+        toolbar2.addSeparator()
+
+        self.reset_btn = QPushButton("Reset for New Scan")
+        self.reset_btn.setToolTip(
+            "Clears the canvas (background image, painted sections, regions, focus points) and all "
+            "plane-fit Z values, so a brand new sample can be started from scratch. Nothing already "
+            "written to disk is deleted or affected."
+        )
+        self.reset_btn.clicked.connect(self._on_reset_clicked)
+        toolbar2.addWidget(self.reset_btn)
+
+        # Third row: Redo/Correct Scans (post-hoc) - load a previously finalized
         # scan_record.json to get the region layout/section Z back, mark specific
         # sections that need a fresh scan, focus one point for all of them (with
-        # the same contrast-confirm review used for a region), then rescan just
-        # that marked set as one Lucas path. Independent of every workflow above -
-        # it's meant to run well after Finalize Results, possibly in a new session.
+        # the same contrast-confirm review used above), then rescan just that
+        # marked set as one Lucas path. Independent of the pipeline above - it's
+        # meant to run well after a scan, possibly in a new session.
         self.addToolBarBreak()
-        toolbar4 = QToolBar("Redo / Correct Scans (post-hoc)", self)
-        self.addToolBar(toolbar4)
+        toolbar3 = QToolBar("Redo / Correct Scans (post-hoc)", self)
+        self.addToolBar(toolbar3)
 
         self.load_scan_record_btn = QPushButton("Load Scan Record...")
         self.load_scan_record_btn.setToolTip(
-            "Loads a previously finalized scan_record.json (Finalize Results' output) to repopulate the "
-            "region layout and each section's scanned Z, for correcting specific sections after the fact. "
-            "Doesn't restore focus points or plane fits - only the layout/Z a targeted redo needs."
+            "Loads a previously finalized scan_record.json to repopulate the region layout and each "
+            "section's scanned Z, for correcting specific sections after the fact. Doesn't restore "
+            "focus points or plane fits - only the layout/Z a targeted redo needs."
         )
         self.load_scan_record_btn.clicked.connect(self._on_load_scan_record_clicked)
-        toolbar4.addWidget(self.load_scan_record_btn)
+        toolbar3.addWidget(self.load_scan_record_btn)
 
-        toolbar4.addSeparator()
+        toolbar3.addSeparator()
 
         self.mark_redo_btn = QPushButton("Mark Sections for Redo")
         self.mark_redo_btn.setCheckable(True)
@@ -608,27 +433,27 @@ class RegionDesignerWindow(QMainWindow):
             "or unmark (right button) them for redo - shown with a magenta overlay."
         )
         self.mark_redo_btn.toggled.connect(self.canvas.set_redo_mode)
-        toolbar4.addWidget(self.mark_redo_btn)
+        toolbar3.addWidget(self.mark_redo_btn)
 
         clear_redo_marks_btn = QPushButton("Clear Redo Marks")
         clear_redo_marks_btn.clicked.connect(self._on_clear_redo_marks_clicked)
-        toolbar4.addWidget(clear_redo_marks_btn)
+        toolbar3.addWidget(clear_redo_marks_btn)
 
-        toolbar4.addSeparator()
-        toolbar4.addWidget(QLabel(" Then either: "))
+        toolbar3.addSeparator()
+        toolbar3.addWidget(QLabel(" Then either: "))
 
         self.create_region_from_marks_btn = QPushButton("Create Region from Marked Sections")
         self.create_region_from_marks_btn.setToolTip(
             "For a more accurate redo than one flat Z: carves the marked sections out into a brand-new "
             "region (its own id, selected automatically below) - double-click within it to place several "
-            "focus points by hand, then use Run Autofocus for Region / Fit Region Plane / Scan Region on "
-            "it exactly like any compiled region, with a proper per-section plane-fit Z. Clears the marks "
-            "and turns off 'Mark Sections for Redo' once created."
+            "focus points by hand, then use the same Global Focus Search pipeline above on it, with a "
+            "proper per-section plane-fit Z. Clears the marks and turns off 'Mark Sections for Redo' "
+            "once created."
         )
         self.create_region_from_marks_btn.clicked.connect(self._on_create_region_from_marks_clicked)
-        toolbar4.addWidget(self.create_region_from_marks_btn)
+        toolbar3.addWidget(self.create_region_from_marks_btn)
 
-        toolbar4.addWidget(QLabel(" or: "))
+        toolbar3.addWidget(QLabel(" or: "))
 
         self.pick_redo_focus_btn = QPushButton("Set Redo Focus Point")
         self.pick_redo_focus_btn.setCheckable(True)
@@ -638,7 +463,7 @@ class RegionDesignerWindow(QMainWindow):
             "remove it."
         )
         self.pick_redo_focus_btn.toggled.connect(self.canvas.set_pick_redo_focus_mode)
-        toolbar4.addWidget(self.pick_redo_focus_btn)
+        toolbar3.addWidget(self.pick_redo_focus_btn)
 
         self.run_redo_autofocus_btn = QPushButton("Run Autofocus for Redo Point")
         self.run_redo_autofocus_btn.setToolTip(
@@ -646,15 +471,15 @@ class RegionDesignerWindow(QMainWindow):
             "scan - the same review dialog used to confirm a region's own focus points."
         )
         self.run_redo_autofocus_btn.clicked.connect(self._on_run_redo_autofocus_clicked)
-        toolbar4.addWidget(self.run_redo_autofocus_btn)
+        toolbar3.addWidget(self.run_redo_autofocus_btn)
 
         self.scan_redo_btn = QPushButton("Scan Redo Sections")
         self.scan_redo_btn.setToolTip(
             "Submits every section marked for redo, all at the confirmed redo focus point's Z, as one "
-            "real Lucas-path scan - same open-loop mechanism as Scan Region, just for this ad hoc set."
+            "real open-loop Lucas-path scan, for this ad hoc set."
         )
         self.scan_redo_btn.clicked.connect(self._on_scan_redo_sections_clicked)
-        toolbar4.addWidget(self.scan_redo_btn)
+        toolbar3.addWidget(self.scan_redo_btn)
 
     def _on_brush_radius_changed(self, value: int):
         self.canvas.brush_radius = value
@@ -667,7 +492,6 @@ class RegionDesignerWindow(QMainWindow):
 
     def _on_image_ready(self, image_path: str):
         self.canvas.set_background_image(image_path)
-        self._last_snap_path = image_path
 
     def _on_command_error(self, message: str):
         QMessageBox.warning(self, "Controller error", message)
@@ -687,19 +511,6 @@ class RegionDesignerWindow(QMainWindow):
         # rather than clearing back to no overlay, so completed sections stay
         # visibly distinguishable as reconstruction works through the rest.
         self._set_section_activity(master_row, master_col, "reconstructing" if active else "reconstructed")
-        if active:
-            return
-        section = (master_row, master_col)
-        for tracker in self._scan_recon_trackers:
-            if section in tracker["remaining"]:
-                tracker["remaining"].remove(section)
-                # Resets the gap clock _recheck_tracker_files measures against -
-                # see _RECON_GAP_TIMEOUT_S. Also clears warned so a later stall,
-                # after this arrival, can report again rather than staying silent.
-                tracker["last_arrival"] = time.monotonic()
-                tracker["warned"] = False
-                if tracker["ready"]:
-                    self._maybe_archive_tracker(tracker)
 
     def _set_section_activity(self, master_row: int, master_col: int, activity: str | None):
         """master_row/master_col are master-grid (absolute) coordinates, as the
@@ -728,7 +539,6 @@ class RegionDesignerWindow(QMainWindow):
         self.canvas.apply_regions(region_of)
         self.canvas.clear_focus_points()
         self.region_inclusion_override = {}  # every region's points are being replaced wholesale
-        self.region_planes = {}
 
         # Tissue is usually overselected a bit, so keep focus points off the outer
         # ~1mm rim of the painted area; fall back to the full region if that leaves
@@ -757,13 +567,11 @@ class RegionDesignerWindow(QMainWindow):
         self.region_id_spin.setValue(0)
         self.canvas.set_active_region(0)
         self._refresh_focus_point_exclusion_visuals()
-        self._save_session()
 
     def _on_clear_regions_clicked(self):
         self.canvas.clear_regions()
         self.region_id_spin.setMaximum(9999)
         self.region_inclusion_override = {}
-        self.region_planes = {}
 
     def _on_snap_focus_points_clicked(self):
         count = self.canvas.snap_focus_points_to_grid()
@@ -771,8 +579,8 @@ class RegionDesignerWindow(QMainWindow):
 
     def _on_reset_clicked(self):
         if (
-            self.bridge.is_busy() or self._af_worker is not None or self._scan_worker is not None
-            or self._review_dialog is not None or self._auto_pipeline_active
+            self.bridge.is_busy() or self._scan_worker is not None
+            or self._global_review_dialog is not None
             or self._redo_af_worker is not None or self._redo_review_dialog is not None
         ):
             QMessageBox.warning(
@@ -783,22 +591,15 @@ class RegionDesignerWindow(QMainWindow):
 
         reply = QMessageBox.question(
             self, "Reset for New Scan",
-            "This clears the canvas (background image, painted sections, regions, focus points), all "
-            "plane-fit Z values, and forgets the current aggregate batch. Nothing already written to "
-            "disk is deleted. Continue?",
+            "This clears the canvas (background image, painted sections, regions, focus points) and all "
+            "plane-fit Z values. Nothing already written to disk is deleted. Continue?",
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
         self.canvas.reset()
         self.region_focus_points = {}
-        self.region_planes = {}
         self.section_z = {}
-        self._af_worker = None
-        self._af_region_id = None
-        self._af_region_items = []
-        self._af_log_path = None
-        self._af_sequence_active = False
         self.global_focus_points = []
         self.global_outlier_sections = set()
         self.global_plane = None
@@ -815,15 +616,8 @@ class RegionDesignerWindow(QMainWindow):
         self._plane_review_dialog = None
         self._plane_review_highlighted_item = None
         self._scanning_region_id = None
-        self._scan_existing_run_folders = set()
         self._full_path_scan_remaining = None
         self._full_path_scan_total = 0
-        self._aggregate_root = None
-        self._scan_recon_trackers = []
-        self._active_scan_tracker = None
-        self._auto_pipeline_region_ids = []
-        self._auto_pipeline_index = 0
-        self._auto_pipeline_wait_tracker = None
         self._redo_af_worker = None
         self._redo_af_item = None
         self._redo_af_log_path = None
@@ -837,119 +631,6 @@ class RegionDesignerWindow(QMainWindow):
         self.region_id_spin.setMaximum(9999)
         self.region_id_spin.setValue(0)
         self.status_label.setText("Reset - ready for a new scan.")
-
-    def _save_session(self):
-        """Checkpoint save of the current region design (see session_state.py's
-        module docstring for exactly what is/isn't persisted) into the active
-        aggregate batch - no-op until one exists. Called after every step that
-        changes something session_state.save_session actually persists, so a
-        crash any time after that step still leaves a reloadable batch."""
-        if self._aggregate_root is None:
-            return
-        session_state.save_session(
-            self._aggregate_root,
-            painted=self.canvas.painted,
-            region_of=self.canvas.region_of,
-            region_focus_points=self.region_focus_points,
-            region_inclusion_override=self.region_inclusion_override,
-            background_image_path=self._last_snap_path,
-        )
-
-    def _on_open_previous_scan_clicked(self):
-        path = QFileDialog.getExistingDirectory(
-            self, "Select a previous aggregate batch folder", confirmation_scan.IMAGES_ROOT,
-        )
-        if not path:
-            return
-        self._aggregate_root = path
-        session = session_state.load_session(path)
-        if session is None:
-            self.status_label.setText(
-                f"Aggregate batch set to: {os.path.basename(path)} (no saved region design found in it - "
-                f"painted regions/focus points were not restored)."
-            )
-            return
-        num_regions, num_sections = self._apply_loaded_session(session)
-        self.status_label.setText(
-            f"Aggregate batch reloaded: {os.path.basename(path)} - restored {num_sections} section(s) "
-            f"across {num_regions} region(s). A region already fully scanned shows \"scanned\"; a region "
-            f"scanned only partway through before shows \"partial\" and can be resumed with Scan Region."
-        )
-
-    def _apply_loaded_session(self, session: dict) -> tuple[int, int]:
-        """Repopulates the canvas/region state from a previously saved
-        session.json (see _on_open_previous_scan_clicked). Returns (number of
-        regions, number of sections) restored, for the status message."""
-        self.canvas.reset()
-
-        region_of = {(row, col): region_id for row, col, region_id in session["region_of"]}
-        self.canvas.painted = {(row, col) for row, col in session["painted"]}
-        self.canvas.apply_regions(region_of)
-
-        self.region_focus_points = {}
-        for region_id, row, col, z in session["region_focus_points"]:
-            self.region_focus_points.setdefault(region_id, []).append((row, col, z))
-
-        self.region_inclusion_override = {}
-        for region_id, row, col, included in session["region_inclusion_override"]:
-            self.region_inclusion_override.setdefault(region_id, {})[(row, col)] = included
-
-        for region_id, points in self.region_focus_points.items():
-            for row, col, _z in points:
-                self.canvas.add_focus_point(region_id, row, col)
-
-        background_image_path = session.get("background_image_path")
-        if background_image_path and os.path.isfile(background_image_path):
-            try:
-                self.canvas.set_background_image(background_image_path)
-                self._last_snap_path = background_image_path
-            except Exception:
-                pass  # non-critical - operator can Snap again for a fresh reference image
-
-        region_ids = sorted(set(region_of.values()))
-        if region_ids:
-            self.region_id_spin.setMaximum(max(region_ids))
-            self.region_id_spin.setValue(region_ids[0])
-            self.canvas.set_active_region(region_ids[0])
-
-        for region_id in region_ids:
-            self._restore_region_status(region_id, region_of)
-
-        return len(region_ids), len(region_of)
-
-    def _restore_region_status(self, region_id: int, region_of: dict[tuple[int, int], int]):
-        """Recomputes region_planes/section_z (from region_focus_points, via
-        the same _fit_plane_for_region a manual Fit Region Plane click uses)
-        and this region's status - always from what's actually on disk under
-        the aggregate root, never from anything saved, so a stale save can
-        never claim more progress than really happened. See
-        session_state.completed_master_sections."""
-        focus_points = self.region_focus_points.get(region_id)
-        if focus_points and len(focus_points) >= 3:
-            self._fit_plane_for_region(region_id)
-
-        status = "confirmed" if focus_points else None
-        if self._aggregate_root is not None:
-            scan_data_dir = os.path.join(self._aggregate_root, f"Region_{region_id}", "Scan_data")
-            if os.path.isdir(scan_data_dir) and self.calibration is not None:
-                region_sections = [s for s, rid in region_of.items() if rid == region_id]
-                done_master = session_state.completed_master_sections(scan_data_dir)
-                expected_master = {
-                    (int(round(self.calibration.offset_row + row)), int(round(self.calibration.offset_col + col)))
-                    for row, col in region_sections
-                }
-                done_count = len(expected_master & done_master)
-                if expected_master and done_count == len(expected_master):
-                    status = "scanned"
-                else:
-                    status = "partial"
-                    self.canvas.set_region_progress(region_id, done_count, len(expected_master))
-            elif os.path.isdir(scan_data_dir):
-                # Scan_data exists but no calibration loaded yet to convert to
-                # master-grid coordinates - can't tell what's done, so don't
-                # guess; leave it "confirmed" until calibration is available.
-                pass
-        self.canvas.set_region_status(region_id, status)
 
     # ---- Redo/correction (post-hoc): load a finalized scan_record.json ----
     def _on_load_scan_record_clicked(self):
@@ -969,32 +650,10 @@ class RegionDesignerWindow(QMainWindow):
             return
 
         self.canvas.reset()
-
-        # Redo scans re-target the same aggregate batch the record was finalized
-        # from (scan_finalize.finalize_aggregate writes it to
-        # <aggregate_root>/Finalized/scan_record.json), so a redo's output
-        # archives alongside the original scan instead of starting a fresh batch.
-        # Resolved before the background-image lookup below, which needs it too.
-        parent_dir = os.path.dirname(path)
-        self._aggregate_root = (
-            os.path.dirname(parent_dir) if os.path.basename(parent_dir) == scan_finalize.FINALIZED_DIR_NAME
-            else parent_dir
-        )
-
-        # _on_start_aggregate_clicked copies the snap regions were painted against
-        # into the aggregate root as _BACKGROUND_SNAP_BASENAME - recover it here so
-        # a reloaded record shows the same reference image rather than a blank
-        # canvas. Best-effort: a batch predating this feature (or one that never
-        # had a snap taken) just has none to find.
-        snap_path = _find_background_snap(self._aggregate_root)
-        if snap_path:
-            self.canvas.set_background_image(snap_path)
-            self._last_snap_path = snap_path
         self.canvas.painted = set(region_of.keys())
         self.canvas.apply_regions(region_of)
 
         self.region_focus_points = {}
-        self.region_planes = {}
         self.section_z = section_z
 
         region_ids = sorted(set(region_of.values()))
@@ -1009,38 +668,6 @@ class RegionDesignerWindow(QMainWindow):
             f"{os.path.basename(path)}. Use 'Mark Sections for Redo' to select sections to correct."
         )
 
-    def _on_start_aggregate_clicked(self):
-        self._aggregate_root = scan_archive.start_new_aggregate_batch()
-        # Durably copy the snap regions were painted against into the batch itself
-        # (see _BACKGROUND_SNAP_BASENAME) and repoint _last_snap_path at that copy,
-        # so _save_session below persists the durable path, not wherever the
-        # camera driver originally wrote it.
-        if self._last_snap_path and os.path.isfile(self._last_snap_path):
-            ext = os.path.splitext(self._last_snap_path)[1]
-            snap_copy_path = os.path.join(self._aggregate_root, _BACKGROUND_SNAP_BASENAME + ext)
-            shutil.copy2(self._last_snap_path, snap_copy_path)
-            self._last_snap_path = snap_copy_path
-        self.status_label.setText(f"New aggregate batch: {os.path.basename(self._aggregate_root)}")
-        self._save_session()
-
-    def _on_finalize_results_clicked(self):
-        if self._aggregate_root is None:
-            QMessageBox.warning(self, "Finalize Results", "Start a new aggregate batch first.")
-            return
-        try:
-            dest_dir, num_sections = scan_finalize.finalize_aggregate(
-                self._aggregate_root, self.canvas.region_of, self.section_z, self.region_focus_points,
-            )
-        except OSError as e:
-            QMessageBox.warning(self, "Finalize Results", f"Could not finalize results: {e}")
-            return
-        if num_sections == 0:
-            QMessageBox.information(
-                self, "Finalize Results", "No scanned, confirmed regions found yet - nothing to finalize."
-            )
-            return
-        self.status_label.setText(f"Finalized {num_sections} section(s) into {dest_dir}")
-
     def _on_export_scan_path_clicked(self):
         if not self.canvas.region_of:
             QMessageBox.warning(self, "Export Scan Path", "Compile regions first.")
@@ -1053,9 +680,8 @@ class RegionDesignerWindow(QMainWindow):
             )
             return
 
-        start_dir = self._aggregate_root or ""
         out_path, _filter = QFileDialog.getSaveFileName(
-            self, "Export Scan Path", start_dir, "Plane path (*.pp)"
+            self, "Export Scan Path", "", "Plane path (*.pp)"
         )
         if not out_path:
             return
@@ -1167,110 +793,12 @@ class RegionDesignerWindow(QMainWindow):
         # manual-jog readouts. See dover_controller/controller_window.py's docstring.
         self._load_calibration_from_path(path)
 
-    def _on_run_autofocus_clicked(self):
-        self._start_autofocus_run(auto_confirm=False, auto_finish=False)
-
-    def _on_auto_run_autofocus_clicked(self):
-        self._start_autofocus_run(auto_confirm=True, auto_finish=self.auto_finish_checkbox.isChecked())
-
-    def _start_autofocus_run(self, auto_confirm: bool, auto_finish: bool) -> bool:
-        """Returns True once the autofocus worker has actually been started,
-        False if it couldn't be (missing calibration/points, or hardware busy)
-        - used by the fully-automated pipeline to detect a region it can't
-        proceed with and stop cleanly rather than hang."""
-        if self.calibration is None:
-            QMessageBox.warning(self, "Run Autofocus", "Load a calibration file first.")
-            return False
-        if self.bridge.is_busy():
-            QMessageBox.warning(self, "Run Autofocus", "Another hardware operation is already in progress.")
-            return False
-
-        region_id = self.region_id_spin.value()
-        # Skips a point _is_region_point_excluded currently considers excluded -
-        # the Global Focus Search's RANSAC flag (if the checkbox is on) or a
-        # manual shift-click override - so a point already known to sit on a
-        # fold/dust doesn't burn real hardware time on a fresh autofocus sweep
-        # and contrast/Auto-Search confirmation, only to be dropped at Fit
-        # Region Plane anyway. A point removed outright (right-click) is simply
-        # absent from canvas.focus_point_items already, so it's covered too.
-        region_items = [
-            item for item in self.canvas.focus_point_items
-            if item.region_id == region_id and not self._is_region_point_excluded(region_id, item.grid_cell())
-        ]
-        points = [item.section() for item in region_items]
-        if not points:
-            all_region_items = [item for item in self.canvas.focus_point_items if item.region_id == region_id]
-            if all_region_items:
-                QMessageBox.information(
-                    self, "Run Autofocus",
-                    f"Every focus point in region {region_id} is currently excluded from plane fitting - "
-                    f"nothing to autofocus. Shift+click a point to re-include it, or add a new one.",
-                )
-            else:
-                QMessageBox.information(self, "Run Autofocus", f"No focus points found for region {region_id}.")
-            return False
-
-        for item in region_items:
-            item.set_status(None)
-
-        self._set_hardware_controls_enabled(False)
-        self.status_label.setText(f"Running autofocus for region {region_id}: 0/{len(points)}")
-        self.canvas.set_region_status(region_id, "focusing")
-        self.canvas.set_region_progress(region_id, 0, len(points))
-
-        # Opened now (rather than after the sequence finishes) and non-modally
-        # (show(), not exec()) so the operator can watch each point's focus
-        # curve appear as it's fitted, without it blocking the canvas.
-        dialog = FocusReviewDialog(self.bridge, self.calibration, region_id, [], parent=self)
-        dialog.set_auto_confirm(auto_confirm, auto_finish=auto_finish)
-        dialog.finished.connect(lambda result, d=dialog, rid=region_id: self._on_review_dialog_finished(rid, d, result))
-        dialog.show()
-        self._review_dialog = dialog
-
-        worker = AutofocusSequenceWorker(
-            self.bridge, self.calibration, points,
-            z_start=self.af_z_start_spin.value(),
-        )
-        worker.pointStarted.connect(self._on_autofocus_point_started)
-        worker.pointFitted.connect(self._on_autofocus_point_fitted)
-        worker.pointFailed.connect(self._on_autofocus_point_failed)
-        worker.sequenceFinished.connect(lambda: self._on_autofocus_sequence_finished(region_id, worker))
-        self._af_region_id = region_id
-        self._af_region_items = region_items
-        self._af_worker = worker  # keep alive for the duration of the sequence
-        self._af_sequence_active = True
-        worker.start()
-        return True
-
-    def _on_autofocus_point_started(self, index: int, total: int):
-        self.status_label.setText(f"Running autofocus: point {index + 1}/{total}")
-        if index < len(self._af_region_items):
-            self._af_region_items[index].set_status("focusing")
-        self.canvas.set_region_progress(self._af_region_id, index, total)
-
-    def _on_autofocus_point_fitted(self, index: int, fit):
-        if index < len(self._af_region_items):
-            self._af_region_items[index].set_status("done")
-            self._af_region_items[index].fit = fit  # for a later shift-click review, see _on_focus_point_shift_clicked
-        self.canvas.set_region_progress(self._af_region_id, index + 1, len(self._af_region_items))
-        if self._review_dialog is not None:
-            self._review_dialog.add_fit(fit)
-
-    def _on_autofocus_point_failed(self, index: int, message: str):
-        if index < len(self._af_region_items):
-            self._af_region_items[index].set_status("failed")
-        QMessageBox.warning(self, "Autofocus failed", f"Point {index}: {message}")
-
     def _set_hardware_controls_enabled(self, enabled: bool):
         """The bridge only allows one hardware-affecting operation in flight at a
         time (see controller_bridge.py's _busy), so every button that starts one
-        - autofocus, auto-run, and a real region scan - is disabled together
-        while any one of them is running."""
-        self.run_autofocus_btn.setEnabled(enabled)
-        self.auto_run_autofocus_btn.setEnabled(enabled)
-        self.scan_region_btn.setEnabled(enabled)
-        self.auto_run_all_regions_btn.setEnabled(enabled)
+        is disabled together while any one of them is running."""
         self.run_global_focus_plane_fitting_btn.setEnabled(enabled)
+        self.run_autofocus_new_points_btn.setEnabled(enabled)
         self.send_scan_path_btn.setEnabled(enabled)
         self.run_redo_autofocus_btn.setEnabled(enabled)
         self.scan_redo_btn.setEnabled(enabled)
@@ -1278,119 +806,15 @@ class RegionDesignerWindow(QMainWindow):
     def _on_cancel_scan_clicked(self):
         self.bridge.cancel_current_scan()
 
-    def _on_autofocus_sequence_finished(self, region_id: int, worker: AutofocusSequenceWorker):
-        self._af_sequence_active = False
-        self._set_hardware_controls_enabled(True)
-        self.status_label.setText(f"Autofocus done for region {region_id}: {len(worker.fits)} point(s) fitted.")
-
-        if self._review_dialog is not None:
-            self._review_dialog.finish_collecting()
-
-        if not worker.fits:
-            self.canvas.set_region_status(region_id, "failed")
-
-        # Written now (coarse/medium/fine sweep data, no confirmed Z yet) so a
-        # region's raw autofocus data survives even if the operator never
-        # confirms it; _on_review_dialog_finished fills in confirmed_z/source
-        # into this same file once (if) they do. See autofocus_log.py.
-        try:
-            self._af_log_path = autofocus_log.write_region_log(region_id, worker.records)
-        except OSError as e:
-            self._af_log_path = None
-            self.status_label.setText(f"Autofocus done for region {region_id}, but could not write its log: {e}")
-
-    def _on_review_dialog_finished(self, region_id: int, dialog: FocusReviewDialog, result: int):
-        if not dialog.fits:
-            pass  # already marked "failed" in _on_autofocus_sequence_finished; nothing to confirm
-        elif result == FocusReviewDialog.DialogCode.Accepted:
-            self.region_focus_points[region_id] = dialog.result_focus_points()
-            # Fresh confirmation - this region's prior manual include/exclude
-            # overrides (if any) no longer necessarily apply to the same points,
-            # and any previously fit plane is now stale until Fit Region Plane
-            # is run again (see PlaneFitReviewDialog's plane-error display).
-            self.region_inclusion_override[region_id] = {}
-            self.region_planes.pop(region_id, None)
-            self._record_confirmed_z(
-                [it for it in self.canvas.focus_point_items if it.region_id == region_id], dialog,
-            )
-            self.status_label.setText(
-                f"Region {region_id}: {len(self.region_focus_points[region_id])} focus point(s) confirmed."
-            )
-            self.canvas.set_region_status(region_id, "confirmed")
-            if self._af_log_path is not None:
-                autofocus_log.update_confirmed(self._af_log_path, dialog.confirmed_z_with_source())
-            if self._aggregate_root is not None:
-                for focus_index, captures in dialog.captures_by_index().items():
-                    if captures:
-                        scan_archive.archive_focus_point(self._aggregate_root, region_id, focus_index, captures)
-                if self._af_log_path is not None:
-                    scan_archive.archive_autofocus_log(self._aggregate_root, region_id, self._af_log_path)
-            self._save_session()
-        else:
-            # Operator declined the fit (or closed the dialog) - go back to
-            # unmarked/pending so a retry is unambiguous.
-            self.canvas.set_region_status(region_id, None)
-
-        if self._review_dialog is dialog:
-            self._review_dialog = None
-
-        self._refresh_focus_point_exclusion_visuals()
-
-        if self._auto_pipeline_active:
-            self._continue_auto_pipeline(region_id, confirmed=result == FocusReviewDialog.DialogCode.Accepted)
-
-    def _on_fit_plane_clicked(self):
-        self._fit_plane_for_region(self.region_id_spin.value())
-
-    def _fit_plane_for_region(self, region_id: int) -> bool:
-        """Returns True on success. Shared by the manual 'Fit Region Plane'
-        button and the fully-automated pipeline."""
-        focus_points = self.region_focus_points.get(region_id)
-        if not focus_points:
-            QMessageBox.information(
-                self, "Fit Region Plane",
-                f"Run autofocus and confirm region {region_id}'s focus points first.",
-            )
-            return False
-
-        region_sections = [s for s, rid in self.canvas.region_of.items() if rid == region_id]
-        if not region_sections:
-            QMessageBox.information(self, "Fit Region Plane", f"No painted sections found for region {region_id}.")
-            return False
-
-        # Drop any point _is_region_point_excluded now considers excluded - the
-        # Global Focus Search's RANSAC flag (if the checkbox is on) or a manual
-        # shift-click override, whichever applies - unless that would leave
-        # fewer than 3 points (RegionPlaneFit's minimum), in which case keep the
-        # original set rather than failing the fit outright.
-        filtered = [
-            (row, col, z) for row, col, z in focus_points
-            if not self._is_region_point_excluded(region_id, (int(round(row)), int(round(col))))
-        ]
-        if len(filtered) >= 3:
-            focus_points = filtered
-
-        try:
-            plane = RegionPlaneFit(focus_points)
-        except ValueError as e:
-            QMessageBox.warning(self, "Fit Region Plane", str(e))
-            return False
-
-        self.region_planes[region_id] = plane
-        self.section_z.update(plane.fill_sections(region_sections))
-        residuals = plane.residuals()
-        self.status_label.setText(
-            f"Region {region_id}: plane fit over {len(region_sections)} section(s), "
-            f"max focus-point residual = {max(residuals):.4f}mm."
-        )
-        return True
-
-    # ---- Global Focus Search (second fitting mode) ----
+    # ---- Global Focus Search: fits one plane across every compiled region's
+    # focus points (RANSAC-flagging outliers), rather than one plane per region ----
     def _on_run_global_focus_plane_fitting_clicked(self):
-        """One-click chain of autofocus -> confirm -> Fit Global RANSAC Plane,
-        the last step firing automatically once the operator confirms the
-        search (see _on_global_review_dialog_finished). Always runs over every
-        compiled region's focus points - Compile Regions must be run first."""
+        """One-click chain of autofocus -> confirm -> fit/update the global
+        plane, the last step firing automatically once the operator confirms
+        the search (see _on_global_review_dialog_finished). Always runs over
+        every compiled region's focus points - Compile Regions must be run
+        first. To autofocus just the points added/failed since the last run,
+        use 'Autofocus New Points' instead."""
         if self.calibration is None:
             QMessageBox.warning(self, "Global Focus Search", "Load a calibration file first.")
             return
@@ -1403,6 +827,32 @@ class RegionDesignerWindow(QMainWindow):
 
         self._global_auto_fit_after_search = True
         self._run_global_focus_search(list(self.canvas.focus_point_items))
+
+    def _on_run_autofocus_new_points_clicked(self):
+        """Autofocuses only the focus points that have never been confirmed -
+        points added (double-click a compiled region) after a prior Global
+        Focus Plane Fitting run, or a point whose previous confirmation never
+        completed. Confirming them merges their Z into region_focus_points
+        (see _apply_global_search_results) without disturbing any other
+        already-confirmed point, then fits (first time) or updates (if a
+        plane already exists) the global plane - same chaining as the
+        one-click full-search button."""
+        if self.calibration is None:
+            QMessageBox.warning(self, "Autofocus New Points", "Load a calibration file first.")
+            return
+        if self.bridge.is_busy():
+            QMessageBox.warning(self, "Autofocus New Points", "Another hardware operation is already in progress.")
+            return
+        new_items = [item for item in self.canvas.focus_point_items if item.z is None]
+        if not new_items:
+            QMessageBox.information(
+                self, "Autofocus New Points",
+                "No new/unconfirmed focus points - add one by double-clicking in a compiled region first.",
+            )
+            return
+
+        self._global_auto_fit_after_search = True
+        self._run_global_focus_search(new_items)
 
     def _run_global_focus_search(self, items: list):
         """Runs autofocus over `items` (every compiled region's focus points),
@@ -1498,37 +948,53 @@ class RegionDesignerWindow(QMainWindow):
         self._refresh_focus_point_exclusion_visuals()
 
         if auto_fit and confirmed:
-            self._on_fit_global_plane_clicked()
+            # First confirmation ever fits the plane from scratch; a later one
+            # (e.g. after Autofocus New Points) updates it instead, so the rest
+            # of the sample's already-fit Z isn't disturbed just to account for
+            # a few added/retried points.
+            if self.global_plane is None:
+                self._on_fit_global_plane_clicked()
+            else:
+                self._on_update_global_plane_clicked()
 
     def _apply_global_search_results(self, items: list, dialog: FocusReviewDialog):
         """Common tail of a confirmed Global Focus Search run - matches each of
         dialog.fits back to the marker it came from by object identity (the
         same FocusFit set on item.fit when its sweep completed - see
-        _on_global_af_point_fitted), records its confirmed Z there, and:
-        - feeds each region's own confirmed points straight back into
-          region_focus_points - so Fit Region Plane can use them right away,
-          without a separate per-region autofocus pass just to populate that
-          dict - and clears its stale plane/manual overrides, same as a normal
-          per-region confirmation would.
-        - builds self.global_focus_points as the full combined set (every
-          region's points together) for _on_fit_global_plane_clicked's RANSAC
-          fit to run over."""
+        _on_global_af_point_fitted), records its confirmed Z there, and merges
+        each by its grid cell into region_focus_points - a cell `items` didn't
+        cover (e.g. an "Autofocus New Points" run only touching some of a
+        region's points) keeps whatever it already had, rather than being
+        dropped. self.global_focus_points is then rebuilt from the merged
+        region_focus_points for _on_fit_global_plane_clicked's RANSAC fit to
+        run over."""
         fit_id_to_item = {id(it.fit): it for it in items if it.fit is not None}
-        by_region: dict[int, list[tuple[float, float, float]]] = {}
+        by_region: dict[int, list[tuple[tuple[int, int], float, float, float]]] = {}
         for i, fit in enumerate(dialog.fits):
             item = fit_id_to_item.get(id(fit))
             z = dialog.confirmed_z.get(i)
             if item is None or z is None:
                 continue
             item.z = z
-            by_region.setdefault(item.region_id, []).append((fit.row, fit.col, z))
+            grid_cell = (int(round(fit.row)), int(round(fit.col)))
+            by_region.setdefault(item.region_id, []).append((grid_cell, fit.row, fit.col, z))
 
-        for region_id, points in by_region.items():
-            self.region_focus_points[region_id] = points
-            self.region_inclusion_override[region_id] = {}
-            self.region_planes.pop(region_id, None)
+        for region_id, entries in by_region.items():
+            merged = {
+                (int(round(row)), int(round(col))): (row, col, z)
+                for row, col, z in self.region_focus_points.get(region_id, [])
+            }
+            for grid_cell, row, col, z in entries:
+                merged[grid_cell] = (row, col, z)
+                # A freshly (re)confirmed point's manual include/exclude
+                # override no longer necessarily applies - let it be
+                # reconsidered by the next fit.
+                self.region_inclusion_override.get(region_id, {}).pop(grid_cell, None)
+            self.region_focus_points[region_id] = list(merged.values())
 
-        self.global_focus_points = [pt for points in by_region.values() for pt in points]
+        self.global_focus_points = [
+            (row, col, z) for points in self.region_focus_points.values() for row, col, z in points
+        ]
 
     @staticmethod
     def _record_confirmed_z(items: list, dialog: FocusReviewDialog):
@@ -1629,14 +1095,10 @@ class RegionDesignerWindow(QMainWindow):
             (int(round(row)), int(round(col))): z for row, col, z in input_points
         }
 
-        # Fit Region Plane already fills section_z (the actual Z a real Scan
-        # Region submits) from its own per-region plane - do the same here from
-        # the global one, over every currently compiled section (or every
+        # Fills section_z (the actual Z Send Scan Path to Controller submits)
+        # from this plane, over every currently compiled section (or every
         # painted one, if regions haven't been compiled yet), so this plane's
-        # result is actually usable for scanning and not just an outlier
-        # report. A later per-region Fit Region Plane still overwrites its own
-        # region's sections with that more locally-fit result, same as running
-        # it twice always would.
+        # result is actually usable for scanning and not just an outlier report.
         sections_to_fill = list(self.canvas.region_of.keys()) or list(self.canvas.painted)
         if sections_to_fill:
             self.section_z.update(plane.fill_sections(sections_to_fill))
@@ -1659,8 +1121,7 @@ class RegionDesignerWindow(QMainWindow):
         needs every current point to produce a valid plane, so nothing about the fit
         itself is partial) - but only pushes a new section_z for sections whose focus
         point is new or whose confirmed Z changed since the last fit/update, leaving
-        every other section's Z (including one a later Fit Region Plane already
-        refined) untouched."""
+        every other section's Z untouched."""
         if self.global_plane is None:
             QMessageBox.information(
                 self, "Global Focus Search",
@@ -1707,8 +1168,7 @@ class RegionDesignerWindow(QMainWindow):
     def _focus_points_excluding_flagged(self) -> dict[int, list[tuple[float, float, float]]]:
         """self.region_focus_points, minus any point _is_region_point_excluded currently
         considers excluded (a manual shift-click override, or - if the checkbox is on - a
-        Global Focus Search RANSAC outlier flag). Same predicate _fit_plane_for_region
-        already applies before fitting a region's plane; scan_path_export.build_scan_path/
+        Global Focus Search RANSAC outlier flag). scan_path_export.build_scan_path/
         export_scan_path take region_focus_points as a plain, unfiltered dict, so a
         caller building a scan path to export or send to the controller must pass this
         filtered view instead, or an untrustworthy point kept out of the plane fit would
@@ -1740,19 +1200,11 @@ class RegionDesignerWindow(QMainWindow):
         title = f"Review Plane Fit - Region {item.region_id}"
         self._open_plane_review_dialog(group, title, preselect=item)
 
-    def _on_review_region_plane_fit_clicked(self):
-        region_id = self.region_id_spin.value()
-        group = [it for it in self.canvas.focus_point_items if it.region_id == region_id]
-        self._open_plane_review_dialog(group, f"Review Plane Fit - Region {region_id}")
-
     def _on_review_global_plane_fit_clicked(self):
-        # _global_af_items is whatever point set the last Global Focus Search
-        # actually ran on - exactly what the global RANSAC plane was fit over.
-        # Falls back to every compiled region's focus points so there's still
-        # something to look at even before a search has been run (just with
-        # nothing to plot per point yet).
-        group = self._global_af_items or list(self.canvas.focus_point_items)
-        group = sorted(group, key=lambda it: it.region_id)
+        # Always every compiled focus point, not just whatever the last search
+        # ran on - so re-reviewing after an incremental "Autofocus New Points"
+        # run still shows the whole sample, not just the newly-added subset.
+        group = sorted(self.canvas.focus_point_items, key=lambda it: it.region_id)
         self._open_plane_review_dialog(group, "Review Plane Fit - Global Focus Search")
 
     def _open_plane_review_dialog(self, items: list, title: str, preselect=None):
@@ -1793,14 +1245,7 @@ class RegionDesignerWindow(QMainWindow):
                 "unavailable": "This point hasn't completed an autofocus sweep yet.",
             }
 
-        # The plane actually in effect for this point's section right now - its
-        # own region's last Fit Region Plane result if it has one, otherwise
-        # (same fallback _on_fit_global_plane_clicked itself uses when filling
-        # section_z) the global RANSAC plane, since that may be what actually
-        # last set this section's Z if Fit Region Plane was never separately
-        # run for it. None if neither has ever been fit yet (or the region one
-        # was invalidated by a later reconfirm).
-        plane = self.region_planes.get(item.region_id) or self.global_plane
+        plane = self.global_plane
         plane_z = plane.z_at(item.fit.row, item.fit.col) if plane is not None else None
         return {"label": label, "excluded": excluded, "fit": item.fit, "z": item.z, "plane_z": plane_z}
 
@@ -1841,9 +1286,9 @@ class RegionDesignerWindow(QMainWindow):
         hardware calls) or that's mid-review (a review dialog still open) - see
         _on_focus_point_add_requested/_on_focus_point_remove_requested."""
         return (
-            self.bridge.is_busy() or self._af_sequence_active or self._global_af_sequence_active
+            self.bridge.is_busy() or self._global_af_sequence_active
             or self._redo_af_sequence_active
-            or self._review_dialog is not None or self._global_review_dialog is not None
+            or self._global_review_dialog is not None
             or self._redo_review_dialog is not None
         )
 
@@ -1865,7 +1310,7 @@ class RegionDesignerWindow(QMainWindow):
         self.canvas.add_focus_point(region_id, row, col)
         self.status_label.setText(
             f"Added a focus point to region {region_id} at ({row:.1f}, {col:.1f}) - "
-            f"run autofocus for the region to focus it."
+            f"run 'Autofocus New Points' to focus it."
         )
         self._refresh_focus_point_exclusion_visuals()
 
@@ -1894,260 +1339,16 @@ class RegionDesignerWindow(QMainWindow):
 
         self.status_label.setText(f"Region {region_id} focus point at {grid_cell} removed.")
 
-    def _on_scan_region_clicked(self):
-        if self.calibration is None:
-            QMessageBox.warning(self, "Scan Region", "Load a calibration file first.")
-            return
-        if self.bridge.is_busy():
-            QMessageBox.warning(self, "Scan Region", "Another hardware operation is already in progress.")
-            return
-        self._start_region_scan(self.region_id_spin.value(), confirm=True)
-
-    def _start_region_scan(self, region_id: int, confirm: bool) -> bool:
-        """Returns True once the scan worker has actually been started.
-        confirm=False (used by the fully-automated pipeline) skips the "are you
-        sure, real hardware will move" prompt, since nobody's there to click it."""
-        region_sections = [s for s, rid in self.canvas.region_of.items() if rid == region_id]
-        if not region_sections:
-            QMessageBox.information(self, "Scan Region", f"No painted sections found for region {region_id}.")
-            return False
-
-        missing_z = [s for s in region_sections if s not in self.section_z]
-        if missing_z:
-            QMessageBox.warning(
-                self, "Scan Region",
-                f"{len(missing_z)} of region {region_id}'s section(s) have no Z yet - "
-                f"run Fit Region Plane for this region first.",
-            )
-            return False
-
-        ordered_sections = clustering.serpentine_order(region_sections)
-        sections_with_z = [(row, col, self.section_z[(row, col)]) for row, col in ordered_sections]
-
-        # Resume support: if this region already has a Scan_data folder in the
-        # active aggregate batch (from a prior session that got interrupted by
-        # a hardware failure - see _apply_loaded_session/_restore_region_status),
-        # drop whichever sections already have their NR image on disk and only
-        # resubmit what's actually missing. The new (smaller) run folder still
-        # archives into that same Scan_data/ folder alongside the earlier one -
-        # scan_finalize.finalize_aggregate already merges every run folder
-        # found there, so nothing else needs to change for that to work.
-        num_already_done = 0
-        if self._aggregate_root is not None and self.calibration is not None:
-            scan_data_dir = os.path.join(self._aggregate_root, f"Region_{region_id}", "Scan_data")
-            done_master = session_state.completed_master_sections(scan_data_dir)
-            if done_master:
-                remaining = [
-                    (row, col, z) for row, col, z in sections_with_z
-                    if (int(round(self.calibration.offset_row + row)), int(round(self.calibration.offset_col + col)))
-                    not in done_master
-                ]
-                num_already_done = len(sections_with_z) - len(remaining)
-                sections_with_z = remaining
-
-        if num_already_done and not sections_with_z:
-            self.canvas.set_region_status(region_id, "scanned")
-            self.status_label.setText(
-                f"Region {region_id}: already fully scanned in this aggregate batch - nothing to resume."
-            )
-            return False
-
-        if confirm:
-            resume_note = (
-                f"\n\n{num_already_done} of {num_already_done + len(sections_with_z)} section(s) were already "
-                f"scanned in a previous session - only the remaining {len(sections_with_z)} will be scanned now."
-                if num_already_done else ""
-            )
-            reply = QMessageBox.question(
-                self, "Scan Region",
-                f"Scan region {region_id} now? This submits a real {len(sections_with_z)}-section scan to the "
-                f"controller - the stage will move for real.\n\n"
-                f"Note: this scan is open-loop (drives straight to the Fit Region Plane Z, no live refocus), "
-                f"unlike DOVER_UI's own Image-Path Scan button which live-autofocuses during the scan - so "
-                f"results can look softer if the plane fit didn't perfectly capture the tissue's tilt/drift."
-                f"{resume_note}",
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return False
-
-        self._set_hardware_controls_enabled(False)
-        self.cancel_scan_btn.setEnabled(True)
-        self.status_label.setText(f"Scanning region {region_id}: {len(sections_with_z)} section(s)...")
-        self.canvas.set_region_status(region_id, "scanning")
-        self._scanning_region_id = region_id
-        # Snapshotted regardless of whether an aggregate batch is active (cheap -
-        # just an os.listdir), so _on_region_scan_finished can diff it either way.
-        self._scan_existing_run_folders = confirmation_scan.list_run_folders()
-
-        # Tracked from scan start (not scan finish) - reconstruction for early
-        # sections in the path can complete well before the whole path does, and
-        # this must catch those too, or the tracker would wait forever for
-        # reconstruction-off events that already happened. Same master-grid
-        # offset RegionScanWorker itself applies internally. Kept as a LIST in
-        # the exact order sections_with_z (this same scan's own serpentine
-        # path order) gives them - see _RECON_GAP_TIMEOUT_S's docstring for why
-        # reconstruction is expected to finish them in this same order.
-        master_sections_ordered = [
-            (int(round(self.calibration.offset_row + row)), int(round(self.calibration.offset_col + col)))
-            for row, col, _z in sections_with_z
-        ]
-        tracker = {
-            "region_id": region_id, "remaining": master_sections_ordered, "folders": None,
-            "ready": False, "warned": False,
-        }
-        self._scan_recon_trackers.append(tracker)
-        self._active_scan_tracker = tracker
-
-        worker = RegionScanWorker(self.bridge, self.calibration, sections_with_z)
-        worker.scanFailed.connect(self._on_region_scan_failed)
-        worker.scanFinished.connect(self._on_region_scan_finished)
-        self._scan_worker = worker  # keep alive for the duration of the scan
-        worker.start()
-        return True
-
     def _on_region_scan_finished(self):
+        """Shared scanFinished handler for RegionScanWorker - only Scan Redo
+        Sections creates one now (region_id is then the string "Redo")."""
         region_id = self._scanning_region_id
         self._set_hardware_controls_enabled(True)
         self.cancel_scan_btn.setEnabled(False)
         self._scan_worker = None
         self.canvas.set_region_status(region_id, "scanned")
         self._scanning_region_id = None
-
-        tracker = self._active_scan_tracker
-        self._active_scan_tracker = None
-        waiting_on_recon = False
-        if tracker is not None:
-            if self._aggregate_root is not None:
-                new_folder_names = confirmation_scan.list_run_folders() - self._scan_existing_run_folders
-                new_run_folders = {
-                    os.path.join(confirmation_scan.IMAGES_ROOT, name) for name in new_folder_names
-                }
-                if new_run_folders:
-                    # Not moved yet - only once every section in tracker["remaining"]
-                    # has reported reconstruction-off (see _on_section_reconstructing/
-                    # _maybe_archive_tracker), so a section still being reconstructed
-                    # when the path itself completes can't have its run folder moved
-                    # out from under the writer still finishing it.
-                    tracker["folders"] = new_run_folders
-                    tracker["ready"] = True
-                    # Only sets it if a live arrival (see _on_section_reconstructing)
-                    # didn't already, for a section that finished reconstructing
-                    # during the scan itself - that's still a more accurate baseline
-                    # than "now" for the gap clock below.
-                    tracker.setdefault("last_arrival", time.monotonic())
-                    timer = QTimer(self)
-                    timer.timeout.connect(lambda t=tracker: self._recheck_tracker_files(t))
-                    tracker["timer"] = timer
-                    timer.start(_RECON_POLL_INTERVAL_MS)
-                    if self._auto_pipeline_active:
-                        # Hold the pipeline here - see _auto_pipeline_wait_tracker's
-                        # docstring for why starting the next region's hardware ops
-                        # before this region's images finish reconstructing is
-                        # unsafe. _maybe_archive_tracker (called just below, and
-                        # again from _on_section_reconstructing/
-                        # _recheck_tracker_files as more sections finish) is what
-                        # actually clears this and advances, once tracker["remaining"]
-                        # is finally empty - which can happen synchronously in the
-                        # call just below, if reconstruction already finished for
-                        # every section during the scan itself.
-                        self._auto_pipeline_wait_tracker = tracker
-                        waiting_on_recon = True
-                    self._maybe_archive_tracker(tracker)
-                else:
-                    self._scan_recon_trackers.remove(tracker)
-            else:
-                self._scan_recon_trackers.remove(tracker)  # no aggregate active - nothing to archive
-
-        if waiting_on_recon:
-            # _maybe_archive_tracker just above may already have resolved this
-            # (and advanced the pipeline) synchronously if every section had
-            # already finished reconstructing - only report "waiting" if it's
-            # actually still waiting.
-            if self._auto_pipeline_wait_tracker is tracker:
-                self.status_label.setText(
-                    f"Region {region_id}: scan complete - waiting for its images to finish reconstructing "
-                    f"before starting the next region (avoids a hardware conflict)..."
-                )
-        else:
-            self.status_label.setText(f"Region {region_id}: scan complete.")
-            if self._auto_pipeline_active:
-                self._advance_auto_pipeline()
-
-    def _maybe_archive_tracker(self, tracker: dict):
-        if not tracker["ready"] or tracker["remaining"]:
-            return  # scan not finished yet, or some section(s) still reconstructing
-        timer = tracker.get("timer")
-        if timer is not None:
-            timer.stop()
-        scan_archive.archive_region_scan(self._aggregate_root, tracker["region_id"], tracker["folders"])
-        if tracker in self._scan_recon_trackers:
-            self._scan_recon_trackers.remove(tracker)
-
-        if self._auto_pipeline_wait_tracker is tracker:
-            # This region's images are now fully reconstructed - safe to start
-            # the next region's autofocus/confirmation captures. See
-            # _auto_pipeline_wait_tracker's docstring.
-            self._auto_pipeline_wait_tracker = None
-            if self._auto_pipeline_active:
-                self._advance_auto_pipeline()
-
-    def _recheck_tracker_files(self, tracker: dict):
-        """Periodic fallback for a region scan's archive-wait: re-checks the
-        actual NR file on disk, in case a reconstruction-off broadcast (see
-        _on_section_reconstructing) was ever missed. tracker["remaining"] is
-        kept in the exact order this region was scanned, and reconstruction is
-        expected to finish sections in that same order - so it's enough to
-        check from the front and stop at the first one not there yet, rather
-        than testing every remaining section on every poll.
-
-        Sections are expected no more than _RECON_GAP_TIMEOUT_S apart; once
-        that long has passed since the last one arrived (live or found here),
-        conclude no more are coming rather than wait on a fixed total budget
-        that can't adapt to how fast reconstruction actually is - and, if Auto
-        Run All Regions is holding on this tracker, release it so the next
-        region isn't blocked forever. The tracker itself is left running (still
-        polling, still eligible to archive) in case a genuinely late straggler
-        still shows up - this only gives up on WAITING for it."""
-        if tracker not in self._scan_recon_trackers or not tracker["ready"]:
-            timer = tracker.get("timer")
-            if timer is not None:
-                timer.stop()
-            return
-
-        while tracker["remaining"]:
-            master_row, master_col = tracker["remaining"][0]
-            filename = f"s-{master_row}-{master_col}_nr_float32.tif"
-            if not any(os.path.isfile(os.path.join(folder, "NR", filename)) for folder in tracker["folders"]):
-                break
-            tracker["remaining"].pop(0)
-            tracker["last_arrival"] = time.monotonic()
-            tracker["warned"] = False
-            self._set_section_activity(master_row, master_col, "reconstructed")
-
-        if not tracker["remaining"]:
-            self._maybe_archive_tracker(tracker)
-            return
-
-        gap = time.monotonic() - tracker["last_arrival"]
-        if gap <= _RECON_GAP_TIMEOUT_S:
-            return
-
-        if not tracker["warned"]:
-            tracker["warned"] = True
-            blocked_note = (
-                " Auto Run All Regions is proceeding to the next region rather than wait indefinitely."
-                if self._auto_pipeline_wait_tracker is tracker else ""
-            )
-            self.status_label.setText(
-                f"Region {tracker['region_id']}: no new reconstructed image in over "
-                f"{_RECON_GAP_TIMEOUT_S} s ({len(tracker['remaining'])} section(s) still unconfirmed) - "
-                f"assuming no more are coming.{blocked_note}"
-            )
-
-        if self._auto_pipeline_wait_tracker is tracker:
-            self._auto_pipeline_wait_tracker = None
-            if self._auto_pipeline_active:
-                self._advance_auto_pipeline()
+        self.status_label.setText(f"Region {region_id}: scan complete.")
 
     def _on_region_scan_failed(self, message: str):
         region_id = self._scanning_region_id
@@ -2158,104 +1359,8 @@ class RegionDesignerWindow(QMainWindow):
         self.status_label.setText(f"Region {region_id}: scan cancelled." if cancelled else f"Region {region_id}: scan failed.")
         self.canvas.set_region_status(region_id, "failed")
         self._scanning_region_id = None
-        tracker = self._active_scan_tracker
-        self._active_scan_tracker = None
-        if tracker is not None and tracker in self._scan_recon_trackers:
-            self._scan_recon_trackers.remove(tracker)  # scan failed/cancelled - nothing to archive
-        if self._auto_pipeline_active:
-            self._end_auto_pipeline(
-                f"Auto Run All Regions: stopped - region {region_id} scan cancelled."
-                if cancelled else f"Auto Run All Regions: stopped - region {region_id} scan failed.",
-                f"Region {region_id} scan cancelled - stopping the automated run."
-                if cancelled else f"Region {region_id} scan failed - stopping the automated run: {message}",
-            )
-        elif not cancelled:
-            QMessageBox.warning(self, "Scan Region", f"Scan failed: {message}")
-
-    def _on_auto_run_all_regions_clicked(self):
-        if self.calibration is None:
-            QMessageBox.warning(self, "Auto Run All Regions", "Load a calibration file first.")
-            return
-        if self.bridge.is_busy() or self._auto_pipeline_active:
-            QMessageBox.warning(self, "Auto Run All Regions", "Another hardware operation is already in progress.")
-            return
-
-        region_ids = sorted(set(self.canvas.region_of.values()))
-        if not region_ids:
-            QMessageBox.information(self, "Auto Run All Regions", "Compile regions first.")
-            return
-
-        reply = QMessageBox.question(
-            self, "Auto Run All Regions",
-            f"Run autofocus, confirm, fit plane, and scan for all {len(region_ids)} region(s) automatically, "
-            f"one after another, with no further per-region confirmation? Real hardware scans will run "
-            f"unattended - use 'Stop After Current Region' to halt between regions.",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        if self._aggregate_root is None:
-            self._aggregate_root = scan_archive.start_new_aggregate_batch()
-            self.status_label.setText(f"New aggregate batch: {os.path.basename(self._aggregate_root)}")
-            self._save_session()
-
-        self._auto_pipeline_active = True
-        self._auto_pipeline_region_ids = region_ids
-        self._auto_pipeline_index = 0
-        self.stop_auto_pipeline_btn.setEnabled(True)
-        self._run_auto_pipeline_region()
-
-    def _on_stop_auto_pipeline_clicked(self):
-        self._auto_pipeline_active = False
-        self.stop_auto_pipeline_btn.setEnabled(False)
-        self.status_label.setText("Auto Run All Regions: stopping after the current region finishes.")
-
-    def _run_auto_pipeline_region(self):
-        region_id = self._auto_pipeline_region_ids[self._auto_pipeline_index]
-        self.region_id_spin.setValue(region_id)
-        self.status_label.setText(
-            f"Auto Run All Regions ({self._auto_pipeline_index + 1}/{len(self._auto_pipeline_region_ids)}): "
-            f"region {region_id} - running autofocus..."
-        )
-        if not self._start_autofocus_run(auto_confirm=True, auto_finish=True):
-            self._end_auto_pipeline(f"Auto Run All Regions: stopped - region {region_id} autofocus could not start.")
-
-    def _continue_auto_pipeline(self, region_id: int, confirmed: bool):
-        """Called from _on_review_dialog_finished once a region's points are
-        either confirmed (auto_finish=True accepted the dialog) or not - picks
-        up the pipeline with fit-plane + scan, or stops it."""
-        if not self._auto_pipeline_active:
-            return  # stopped by the user while this region's autofocus/review was running
-        if not confirmed:
-            self._end_auto_pipeline(
-                f"Auto Run All Regions: stopped - region {region_id} was not confirmed.",
-                f"Region {region_id}'s focus points were not confirmed (autofocus failed, or every "
-                f"capture in the review failed) - stopping the automated run.",
-            )
-            return
-        if not self._fit_plane_for_region(region_id):
-            self._end_auto_pipeline(f"Auto Run All Regions: stopped - region {region_id} plane fit failed.")
-            return
-        if not self._start_region_scan(region_id, confirm=False):
-            self._end_auto_pipeline(f"Auto Run All Regions: stopped - region {region_id} scan could not start.")
-
-    def _advance_auto_pipeline(self):
-        if not self._auto_pipeline_active:
-            return  # stopped by the user while this region's scan was running
-        self._auto_pipeline_index += 1
-        if self._auto_pipeline_index >= len(self._auto_pipeline_region_ids):
-            self._end_auto_pipeline(
-                f"Auto Run All Regions: all {len(self._auto_pipeline_region_ids)} region(s) finished."
-            )
-            return
-        self._run_auto_pipeline_region()
-
-    def _end_auto_pipeline(self, status_message: str, warning_message: str | None = None):
-        self._auto_pipeline_active = False
-        self.stop_auto_pipeline_btn.setEnabled(False)
-        self.status_label.setText(status_message)
-        if warning_message:
-            QMessageBox.warning(self, "Auto Run All Regions", warning_message)
+        if not cancelled:
+            QMessageBox.warning(self, "Scan", f"Scan failed: {message}")
 
     # ---- Redo/correction (post-hoc): marking, focus point, autofocus, scan ----
     def _on_clear_redo_marks_clicked(self):
@@ -2300,7 +1405,7 @@ class RegionDesignerWindow(QMainWindow):
         self.canvas.set_active_region(region_id)
         self.status_label.setText(
             f"Created region {region_id} from {count} marked section(s) - double-click within it to add "
-            f"focus points, then Run Autofocus for Region to focus and confirm them."
+            f"focus points, then Autofocus New Points to focus and confirm them."
         )
 
     def _on_run_redo_autofocus_clicked(self):
@@ -2390,12 +1495,6 @@ class RegionDesignerWindow(QMainWindow):
             )
             if self._redo_af_log_path is not None:
                 autofocus_log.update_confirmed(self._redo_af_log_path, dialog.confirmed_z_with_source())
-            if self._aggregate_root is not None:
-                for focus_index, captures in dialog.captures_by_index().items():
-                    if captures:
-                        scan_archive.archive_focus_point(self._aggregate_root, "Redo", focus_index, captures)
-                if self._redo_af_log_path is not None:
-                    scan_archive.archive_autofocus_log(self._aggregate_root, "Redo", self._redo_af_log_path)
         else:
             # Operator declined the fit (or closed the dialog) - go back to
             # unconfirmed so a retry is unambiguous.
@@ -2439,21 +1538,6 @@ class RegionDesignerWindow(QMainWindow):
         self.cancel_scan_btn.setEnabled(True)
         self.status_label.setText(f"Scanning {len(sections_with_z)} redo section(s)...")
         self._scanning_region_id = "Redo"
-        self._scan_existing_run_folders = confirmation_scan.list_run_folders()
-
-        # Tracked from scan start, same convention _start_region_scan uses for a
-        # real region scan - see its own tracker comment for why (reconstruction
-        # for early sections can finish well before the whole path does).
-        master_sections_ordered = [
-            (int(round(self.calibration.offset_row + row)), int(round(self.calibration.offset_col + col)))
-            for row, col in ordered_sections
-        ]
-        tracker = {
-            "region_id": "Redo", "remaining": master_sections_ordered, "folders": None,
-            "ready": False, "warned": False,
-        }
-        self._scan_recon_trackers.append(tracker)
-        self._active_scan_tracker = tracker
 
         worker = RegionScanWorker(self.bridge, self.calibration, sections_with_z)
         worker.scanFailed.connect(self._on_region_scan_failed)

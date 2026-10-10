@@ -83,6 +83,13 @@ class ControllerBridge(QObject):
     broadcastReceived = Signal(str, dict)   # msg_type, payload - any other COMM broadcast
                                              # not already handled above
     temperatureUpdated = Signal(dict)       # payload keyed by ic.cTEMP_SENSOR_1..7
+    # cCURRENT_WORK_DIRECTORY_MSG - the controller/stitcher announcing the datetime-
+    # generated folder it just created for a real scan's own output (same message
+    # DOVER_UI/Windows/scan_info_window.py's handle_new_scan_directory reacts to by
+    # copying its slide.tif/tag.tif into it). Dedicated signal (not folded into
+    # broadcastReceived) since main_window needs to react to this one specifically -
+    # see its _on_scan_work_directory_ready.
+    scanWorkDirectoryReady = Signal(str)    # work directory path
 
     def __init__(self):
         super().__init__()
@@ -162,6 +169,8 @@ class ControllerBridge(QObject):
             # Dedicated signal (not folded into broadcastReceived below) - every Dover
             # Controller tab/status strip cares about it and it's high-frequency.
             self.temperatureUpdated.emit(msg.get_msg_payload())
+        elif msg_type == ic.cCURRENT_WORK_DIRECTORY_MSG:
+            self.scanWorkDirectoryReady.emit(msg.get_msg_payload()[ic.cWORK_DIRECTORY_PATH_PARAM])
         elif msg_type == ic.cINTERNAL_CONFIG_VALUES_MSG:
             # Mirrors MessageHandler.handle_internal_config_msg: the reply's own
             # fSenderSignature (which module answered - CTL_TARGET/RECONSTRUCTION_TARGET/
