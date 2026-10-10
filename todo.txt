@@ -12,3 +12,5 @@ focus plot:
 - click on point to show focus plot
 
 make scan button bigger and different colour
+
+show section number (r,c)
