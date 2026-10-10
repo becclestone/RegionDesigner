@@ -85,6 +85,11 @@ class RegionDesignerWindow(QMainWindow):
         self.bridge.commandError.connect(self._on_command_error)
         self.bridge.sectionScanning.connect(self._on_section_scanning)
         self.bridge.sectionReconstructing.connect(self._on_section_reconstructing)
+        # Must happen before _dover_window.show() below - its showEvent sends
+        # request_internal_config() immediately, which needs rmq_setup's
+        # destination registration (see ControllerBridge.connect_to_controller)
+        # to have already run or TIsMsg.send_q_destination raises.
+        self.bridge.connect_to_controller()
 
         self._goji_scheduler = GojiScheduler(self.bridge)
         self._dover_window = DoverControllerWindow(self.bridge, self._goji_scheduler, parent=self)
@@ -211,7 +216,6 @@ class RegionDesignerWindow(QMainWindow):
 
         self._load_default_calibration()
 
-        self.bridge.connect_to_controller()
         self._goji_scheduler.start()
 
     def _load_default_calibration(self):

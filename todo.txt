@@ -1,5 +1,5 @@
 snap on drag onbydefault
-move to scan position ag\ftersnap
+DONE - move to scan position after snap / scan path
 snap onplace
 consistent z range probably by region idk
 somehow make selections more clear pls cause
