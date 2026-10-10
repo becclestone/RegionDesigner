@@ -447,6 +447,18 @@ class RegionDesignerWindow(QMainWindow):
         self.send_scan_path_btn.clicked.connect(self._on_send_scan_path_to_controller_clicked)
         toolbar2.addWidget(self.send_scan_path_btn)
 
+        self.cancel_scan_btn = QPushButton("Cancel Scan")
+        self.cancel_scan_btn.setToolTip(
+            "Aborts whichever scan (Scan Region / Send Scan Path to Controller / Scan Redo "
+            "Sections) is currently running - sends the cancel command to both the controller "
+            "and reconstruction, same as DOVER_UI's Image-Path window's Cancel button, and "
+            "immediately re-enables the other hardware controls rather than waiting for the "
+            "controller's own reply."
+        )
+        self.cancel_scan_btn.setEnabled(False)
+        self.cancel_scan_btn.clicked.connect(self._on_cancel_scan_clicked)
+        toolbar2.addWidget(self.cancel_scan_btn)
+
         # Third row: Global Focus Search - the alternative fitting mode. Its own
         # row since it's a distinct workflow (whole-sample, not per-region), but
         # it doesn't depend on Compile Regions in either direction - it can be
@@ -1071,6 +1083,7 @@ class RegionDesignerWindow(QMainWindow):
         self._full_path_scan_total = len(rows)
 
         self._set_hardware_controls_enabled(False)
+        self.cancel_scan_btn.setEnabled(True)
         self.status_label.setText(f"Sending scan path to controller: 0/{len(rows)} section(s) scanned...")
 
         worker = PlanePathScanWorker(self.bridge, self.calibration, rows)
@@ -1081,6 +1094,7 @@ class RegionDesignerWindow(QMainWindow):
 
     def _on_full_path_scan_finished(self):
         self._set_hardware_controls_enabled(True)
+        self.cancel_scan_btn.setEnabled(False)
         total = self._full_path_scan_total
         done = total - len(self._full_path_scan_remaining or ())
         self._full_path_scan_remaining = None
@@ -1089,10 +1103,14 @@ class RegionDesignerWindow(QMainWindow):
 
     def _on_full_path_scan_failed(self, message: str):
         self._set_hardware_controls_enabled(True)
+        self.cancel_scan_btn.setEnabled(False)
         self._full_path_scan_remaining = None
         self._scan_worker = None
-        QMessageBox.warning(self, "Send Scan Path", f"Scan path failed: {message}")
-        self.status_label.setText("Scan path failed.")
+        if message == "Scan cancelled.":
+            self.status_label.setText("Scan path cancelled.")
+        else:
+            QMessageBox.warning(self, "Send Scan Path", f"Scan path failed: {message}")
+            self.status_label.setText("Scan path failed.")
 
     def _on_load_calibration_clicked(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select a calibration data file", "", "JSON Files (*.json)")
@@ -1212,6 +1230,9 @@ class RegionDesignerWindow(QMainWindow):
         self.send_scan_path_btn.setEnabled(enabled)
         self.run_redo_autofocus_btn.setEnabled(enabled)
         self.scan_redo_btn.setEnabled(enabled)
+
+    def _on_cancel_scan_clicked(self):
+        self.bridge.cancel_current_scan()
 
     def _on_autofocus_sequence_finished(self, region_id: int, worker: AutofocusSequenceWorker):
         self._af_sequence_active = False
@@ -2040,6 +2061,7 @@ class RegionDesignerWindow(QMainWindow):
                 return False
 
         self._set_hardware_controls_enabled(False)
+        self.cancel_scan_btn.setEnabled(True)
         self.status_label.setText(f"Scanning region {region_id}: {len(sections_with_z)} section(s)...")
         self.canvas.set_region_status(region_id, "scanning")
         self._scanning_region_id = region_id
@@ -2076,6 +2098,8 @@ class RegionDesignerWindow(QMainWindow):
     def _on_region_scan_finished(self):
         region_id = self._scanning_region_id
         self._set_hardware_controls_enabled(True)
+        self.cancel_scan_btn.setEnabled(False)
+        self._scan_worker = None
         self.canvas.set_region_status(region_id, "scanned")
         self._scanning_region_id = None
 
@@ -2217,20 +2241,25 @@ class RegionDesignerWindow(QMainWindow):
 
     def _on_region_scan_failed(self, message: str):
         region_id = self._scanning_region_id
+        cancelled = message == "Scan cancelled."
         self._set_hardware_controls_enabled(True)
-        self.status_label.setText(f"Region {region_id}: scan failed.")
+        self.cancel_scan_btn.setEnabled(False)
+        self._scan_worker = None
+        self.status_label.setText(f"Region {region_id}: scan cancelled." if cancelled else f"Region {region_id}: scan failed.")
         self.canvas.set_region_status(region_id, "failed")
         self._scanning_region_id = None
         tracker = self._active_scan_tracker
         self._active_scan_tracker = None
         if tracker is not None and tracker in self._scan_recon_trackers:
-            self._scan_recon_trackers.remove(tracker)  # scan failed - nothing to archive
+            self._scan_recon_trackers.remove(tracker)  # scan failed/cancelled - nothing to archive
         if self._auto_pipeline_active:
             self._end_auto_pipeline(
-                f"Auto Run All Regions: stopped - region {region_id} scan failed.",
-                f"Region {region_id} scan failed - stopping the automated run: {message}",
+                f"Auto Run All Regions: stopped - region {region_id} scan cancelled."
+                if cancelled else f"Auto Run All Regions: stopped - region {region_id} scan failed.",
+                f"Region {region_id} scan cancelled - stopping the automated run."
+                if cancelled else f"Region {region_id} scan failed - stopping the automated run: {message}",
             )
-        else:
+        elif not cancelled:
             QMessageBox.warning(self, "Scan Region", f"Scan failed: {message}")
 
     def _on_auto_run_all_regions_clicked(self):
@@ -2497,6 +2526,7 @@ class RegionDesignerWindow(QMainWindow):
             return
 
         self._set_hardware_controls_enabled(False)
+        self.cancel_scan_btn.setEnabled(True)
         self.status_label.setText(f"Scanning {len(sections_with_z)} redo section(s)...")
         self._scanning_region_id = "Redo"
         self._scan_existing_run_folders = confirmation_scan.list_run_folders()
@@ -2522,5 +2552,7 @@ class RegionDesignerWindow(QMainWindow):
         worker.start()
 
     def closeEvent(self, event):
+        if self._scan_worker is not None:
+            self.bridge.cancel_current_scan()
         self.bridge.shutdown()
         super().closeEvent(event)

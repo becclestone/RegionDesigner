@@ -479,5 +479,24 @@ class ControllerBridge(QObject):
         if reply_payload.get(src.cERROR) != src.cSUCCESS:
             raise RuntimeError(reply_payload.get(src.cERROR_STR, "Scan failed."))
 
+    def cancel_current_scan(self) -> None:
+        """Fire-and-forget abort of whatever path scan is currently in flight. Mirrors
+        DOVER_UI's Utilities/utilities.py cancel_scan (sends cCANCEL_PATH_MOVES_MSG to both
+        CTL_TARGET - stop the stage - and RECONSTRUCTION_TARGET - stop processing in-flight
+        images), and - unlike DOVER_UI's PathWindow, which just waits for the controller's own
+        cPATH_UPDATE_MSG/error reply to clear its in_motion flag - immediately unblocks this
+        bridge's own pending run_path_scan/run_plane_path_scan call by pushing a synthetic
+        cancelled result onto _path_reply_queue (the same queue _send_path_msg's blocking
+        .get() is waiting on, and the same queue _drain() already treats a stale leftover
+        reply on, e.g. after a timeout), rather than depending on the controller eventually
+        sending a reply that actually gets routed somewhere _send_path_msg can see it.
+
+        Safe to call even if nothing is running - the synthetic reply just sits in the queue
+        for the next call's _drain() to discard, same as an unconsumed timeout leftover today.
+        """
+        for target in (ic.CTL_TARGET, ic.RECONSTRUCTION_TARGET):
+            TIsMsg.create_cmd_msg(ic.cCANCEL_PATH_MOVES_MSG, target).send_q_destroy()
+        self._path_reply_queue.put(("cancelled", {src.cERROR: "cancelled", src.cERROR_STR: "Scan cancelled."}))
+
     def shutdown(self):
         self._running = False
