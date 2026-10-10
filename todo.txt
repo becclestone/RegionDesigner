@@ -1,7 +1,6 @@
 snap on drag onbydefault
 move to scan position ag\ftersnap
 snap onplace
-orange
 consistent z range probably by region idk
 somehow make selections more clear pls cause
 
